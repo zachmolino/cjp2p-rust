@@ -11,6 +11,7 @@ pub mod cli;
 pub mod client;
 pub mod git;
 pub mod gitbug;
+pub mod review;
 pub mod types;
 
 #[cfg(feature = "tui")]

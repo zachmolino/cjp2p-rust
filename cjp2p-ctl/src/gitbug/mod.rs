@@ -3,6 +3,7 @@
 //! serialization (Go `encoding/json` byte-exact), conformance-tested against
 //! git-bug v0.10.1 (see `tests/conformance/`).
 
+pub mod bug;
 pub mod clock;
 pub mod gobytes;
 pub mod id;
