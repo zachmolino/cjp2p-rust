@@ -160,6 +160,7 @@ fn send_compose(app: &mut App) {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
 
     let peers = app.status.as_ref().map(|s| s.active_peers.clone()).unwrap_or_default();
+    let mut sent = 0usize;
     for peer in &peers {
         let to = peer.pubkey.trim_start_matches("0x");
         if to.is_empty() {
@@ -182,11 +183,19 @@ fn send_compose(app: &mut App) {
             }
         }])
         .to_string();
-        let _ = app.ws_tx.send(frame);
+        if app.ws_tx.send(frame).is_ok() {
+            sent += 1;
+        }
     }
 
-    // Local echo so the sender sees their own line immediately.
-    app.activity.push_front(format!("you: {text}"));
+    // Only echo a local "you:" line when at least one frame actually went out;
+    // otherwise tell the user nothing was sent instead of faking success.
+    let line = if sent > 0 {
+        format!("you: {text}")
+    } else {
+        "(no active peers \u{2014} not sent)".to_string()
+    };
+    app.activity.push_front(line);
     while app.activity.len() > 200 {
         app.activity.pop_back();
     }

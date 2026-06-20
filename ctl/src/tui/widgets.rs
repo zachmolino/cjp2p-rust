@@ -71,7 +71,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_peers(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Peers;
-    let peers = app.status.as_ref().map(|s| s.active_peers.clone()).unwrap_or_default();
+    let peers = app.status.as_ref().map(|s| s.active_peers.as_slice()).unwrap_or_default();
     let rows: Vec<Row> = peers
         .iter()
         .map(|p| {
@@ -161,8 +161,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn short(s: &str) -> String {
-    if s.len() > 12 {
-        format!("{}\u{2026}", &s[..12])
+    if s.chars().count() > 12 {
+        format!("{}\u{2026}", s.chars().take(12).collect::<String>())
     } else {
         s.to_string()
     }
