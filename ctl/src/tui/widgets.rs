@@ -14,7 +14,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(5),
             Constraint::Min(5),
-            Constraint::Length(if app.show_activity {
+            Constraint::Length(if app.input_mode {
+                3
+            } else if app.show_activity {
                 8
             } else {
                 1
@@ -136,6 +138,14 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    if app.input_mode {
+        let line = format!("> {}\u{2588}", app.compose);
+        f.render_widget(
+            Paragraph::new(line).block(block("message (enter send \u{b7} esc cancel)", true)),
+            area,
+        );
+        return;
+    }
     if app.show_activity {
         let cap = area.height.saturating_sub(2) as usize;
         let items: Vec<ListItem> =
@@ -143,7 +153,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(List::new(items).block(block("activity (w to hide)", false)), area);
     } else {
         let help = app.last_error.clone().map(|e| format!("\u{26a0} {e}")).unwrap_or_else(|| {
-            "q quit  \u{b7}  tab switch pane  \u{b7}  \u{2191}/\u{2193} move  \u{b7}  w activity"
+            "i compose  \u{b7}  q quit  \u{b7}  tab switch pane  \u{b7}  \u{2191}/\u{2193} move  \u{b7}  w activity"
                 .to_string()
         });
         f.render_widget(Paragraph::new(help).style(Style::default().fg(Color::DarkGray)), area);
