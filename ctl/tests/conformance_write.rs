@@ -7,8 +7,11 @@
 //! `~/go/bin/git-bug`, or via `GIT_BUG=/path/to/git-bug`. Pinned to v0.10.1
 //! (see tests/conformance/README.md).
 
-use cjp2p_ctl::gitbug::gobytes::{Author, CreateOp, Nonce, Operation, OperationPack};
+use cjp2p_ctl::gitbug::gobytes::{
+    Author, CreateOp, IdentityVersion, Nonce, Operation, OperationPack,
+};
 use cjp2p_ctl::gitbug::store::Store;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
@@ -98,6 +101,65 @@ fn git_bug_reads_a_bug_written_by_cjp2p() {
         stdout.contains(&bug_id.full()[..7]),
         "git-bug shows a different id; ours={}, output: {stdout:?}",
         bug_id.full()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The full from-scratch path: cjp2p builds an ENTIRE git-bug board (identity +
+/// bug) in a bare repo with no git-bug involvement, then a vanilla git-bug reads
+/// the bug AND resolves the author identity cjp2p wrote.
+#[test]
+fn git_bug_reads_a_board_cjp2p_built_from_scratch() {
+    let Some(gb) = git_bug_bin() else {
+        eprintln!("SKIP git_bug_reads_a_board_cjp2p_built_from_scratch: no git-bug binary");
+        return;
+    };
+
+    let dir = std::env::temp_dir().join(format!("cjp2p-scratch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // cjp2p creates the repo + identity + bug entirely on its own.
+    let store = Store::init(&dir).unwrap();
+    let version = IdentityVersion {
+        version: 2,
+        times: BTreeMap::new(),
+        unix_time: 1781944244,
+        name: "Zach Norman".into(),
+        email: "z@a-i.sh".into(),
+        nonce: Nonce::from_b64("bmh5eWgSjaEJuPkGnt1lHGef4DQ="),
+    };
+    let author = store.write_identity(&version, 1781944244).unwrap();
+    let pack = OperationPack {
+        author: Author {
+            id: author.full().to_string(),
+        },
+        ops: vec![Operation::Create(CreateOp::new(
+            1781944244,
+            Nonce::from_b64("2hAOiWL+W83dtXHZGYXAE5ZYh80="),
+            "From scratch by cjp2p".into(),
+            "Body from cjp2p".into(),
+        ))],
+    };
+    let bug = store.create_bug(&pack, 2, 1781944245).unwrap();
+
+    // Vanilla git-bug reads the bug...
+    let _ = std::fs::remove_dir_all(dir.join(".git/git-bug"));
+    let bugls = run(&gb, &dir, &["bug"]);
+    let bugout = String::from_utf8_lossy(&bugls.stdout);
+    assert!(bugls.status.success(), "git-bug bug: {}", String::from_utf8_lossy(&bugls.stderr));
+    assert!(
+        bugout.contains("From scratch by cjp2p") && bugout.contains(&bug.full()[..7]),
+        "git-bug did not read our bug; output: {bugout:?}"
+    );
+
+    // ...and resolves the identity cjp2p wrote.
+    let userls = run(&gb, &dir, &["user", "--format", "json"]);
+    let userout = String::from_utf8_lossy(&userls.stdout);
+    assert!(
+        userout.contains("Zach Norman") && userout.contains(&author.full()[..]),
+        "git-bug did not resolve our identity; output: {userout:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
