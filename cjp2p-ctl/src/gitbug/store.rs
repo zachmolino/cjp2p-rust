@@ -12,7 +12,7 @@
 //! Pure Rust via gix (no libgit2). This is the object/ref layer; bundles still
 //! go through the `git` CLI (Task #6).
 
-use crate::gitbug::gobytes::{to_gobytes, OperationPack};
+use crate::gitbug::gobytes::{to_gobytes, IdentityVersion, OperationPack};
 use crate::gitbug::id::Id;
 use anyhow::{Context, Result};
 use gix::objs::tree::{Entry, EntryKind};
@@ -117,6 +117,33 @@ impl Store {
             extra_headers: Vec::new(),
         };
         Ok(self.repo.write_object(&commit)?.detach())
+    }
+
+    /// Write an identity (its first version object) to `refs/identities/<id>`.
+    /// The identity tree is a single `version` blob (no clock/version markers,
+    /// unlike bug packs). Returns the id (= `sha256(gobytes(version))`).
+    pub fn write_identity(&self, version: &IdentityVersion, commit_time: i64) -> Result<Id> {
+        let id = version.id();
+        let version_oid = self.repo.write_blob(to_gobytes(version))?.detach();
+        let blob: gix::objs::tree::EntryMode = EntryKind::Blob.into();
+        let tree = self
+            .repo
+            .write_object(&Tree {
+                entries: vec![Entry {
+                    mode: blob,
+                    filename: "version".into(),
+                    oid: version_oid,
+                }],
+            })?
+            .detach();
+        let commit = self.write_commit(tree, None, commit_time)?;
+        self.repo.reference(
+            format!("refs/identities/{}", id.full()),
+            commit,
+            PreviousValue::MustNotExist,
+            "git-bug: identity",
+        )?;
+        Ok(id)
     }
 
     /// Create a new bug from its first (Create) operation pack, at lamport time
