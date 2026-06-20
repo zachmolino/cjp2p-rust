@@ -12,6 +12,7 @@
 //! Pure Rust via gix (no libgit2). This is the object/ref layer; bundles still
 //! go through the `git` CLI (Task #6).
 
+use crate::gitbug::bug::{self, BugState};
 use crate::gitbug::gobytes::{to_gobytes, IdentityVersion, OperationPack};
 use crate::gitbug::id::Id;
 use anyhow::{Context, Result};
@@ -37,6 +38,17 @@ impl Store {
         Ok(Self {
             repo: gix::open(path.as_ref().to_path_buf())?,
         })
+    }
+
+    /// Open an existing repo, or initialize a fresh one if it isn't a git repo.
+    pub fn open_or_init(path: impl AsRef<Path>) -> Result<Self> {
+        let p = path.as_ref();
+        match gix::open(p.to_path_buf()) {
+            Ok(repo) => Ok(Self {
+                repo,
+            }),
+            Err(_) => Self::init(p),
+        }
     }
 
     fn empty_blob(&self) -> Result<gix::ObjectId> {
@@ -206,12 +218,96 @@ impl Store {
         }
         Ok(ids)
     }
+
+    /// Read and fold a bug into its current state.
+    pub fn read_bug(&self, bug_id: &Id) -> Result<BugState> {
+        bug::fold_packs(bug_id.clone(), &self.read_bug_packs(bug_id)?)
+    }
+
+    /// Every bug, folded to current state.
+    pub fn list_bugs(&self) -> Result<Vec<BugState>> {
+        self.bug_ids()?.iter().map(|id| self.read_bug(id)).collect()
+    }
+
+    /// All identity ids present (`refs/identities/*`).
+    pub fn identity_ids(&self) -> Result<Vec<Id>> {
+        let mut ids = Vec::new();
+        for r in self.repo.references()?.prefixed("refs/identities/")? {
+            let r = r.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let name = r.name().as_bstr().to_string();
+            if let Some(hex) = name.strip_prefix("refs/identities/") {
+                ids.push(Id::new(hex)?);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Next Lamport value for a new op: one past every existing op + identity.
+    /// git-bug's global clock ticks once per op; the exact value only affects
+    /// merge order, which a single author posting sequentially keeps monotonic.
+    pub fn next_lamport(&self) -> Result<u64> {
+        let mut ticks = self.identity_ids()?.len() as u64;
+        for id in self.bug_ids()? {
+            for pack in self.read_bug_packs(&id)? {
+                let v: serde_json::Value = serde_json::from_slice(&pack)?;
+                ticks +=
+                    v.get("ops").and_then(|o| o.as_array()).map(|a| a.len() as u64).unwrap_or(1);
+            }
+        }
+        Ok(ticks + 1)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gitbug::gobytes::{Author, CreateOp, Nonce, Operation};
+    use crate::gitbug::gobytes::{
+        status, Author, CreateOp, LabelChangeOp, Nonce, Operation, SetStatusOp,
+    };
+
+    #[test]
+    fn read_bug_folds_title_labels_status() {
+        let dir = tempdir();
+        let store = Store::init(&dir).unwrap();
+        let n = Nonce::from_b64("2hAOiWL+W83dtXHZGYXAE5ZYh80=");
+        let author = || Author {
+            id: "a".repeat(64),
+        };
+
+        let create = OperationPack {
+            author: author(),
+            ops: vec![Operation::Create(CreateOp::new(
+                1,
+                n.clone(),
+                "My change".into(),
+                "desc".into(),
+            ))],
+        };
+        let id = store.create_bug(&create, 2, 1).unwrap();
+        let labels = OperationPack {
+            author: author(),
+            ops: vec![Operation::LabelChange(LabelChangeOp::new(
+                1,
+                n.clone(),
+                vec!["type:change".into(), "review:open".into()],
+                vec![],
+            ))],
+        };
+        store.append_pack(&id, &labels, 3, 1).unwrap();
+        let close = OperationPack {
+            author: author(),
+            ops: vec![Operation::SetStatus(SetStatusOp::new(1, n.clone(), status::CLOSED))],
+        };
+        store.append_pack(&id, &close, 4, 1).unwrap();
+
+        let st = store.read_bug(&id).unwrap();
+        assert_eq!(st.title, "My change");
+        assert_eq!(st.status, crate::gitbug::bug::Status::Closed);
+        assert!(st.labels.contains("type:change"));
+        assert_eq!(st.review_state(), Some("open"));
+        assert_eq!(st.kind(), Some("change"));
+        assert_eq!(st.comments.len(), 1, "the Create message is the first comment");
+    }
 
     fn sample_pack() -> (OperationPack, &'static str) {
         let pack = OperationPack {

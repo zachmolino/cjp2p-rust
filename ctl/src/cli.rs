@@ -66,6 +66,39 @@ pub enum Cmd {
     },
     /// live terminal dashboard (requires a --features tui build)
     Tui,
+    /// local git-bug review board (read/post over a repo)
+    Review {
+        #[command(subcommand)]
+        cmd: ReviewCmd,
+    },
+}
+
+/// `cjp2pctl review …` — operate on a local git-bug board repo.
+#[derive(Subcommand)]
+pub enum ReviewCmd {
+    /// list review items with status + labels
+    List {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// show one item by id prefix
+    Show {
+        id: String,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// post a new review item (defaults to `type:change` + `review:open`)
+    Post {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        message: Option<String>,
+        /// repeatable, e.g. --label type:change --label review:open
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -199,6 +232,99 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 bail!(
                     "this build has no TUI — rebuild with: cargo build -p cjp2p-ctl --features tui"
                 );
+            }
+        }
+        Cmd::Review {
+            cmd,
+        } => review_dispatch(cmd, cli.json)?,
+    }
+    Ok(())
+}
+
+fn review_dispatch(cmd: ReviewCmd, json: bool) -> Result<()> {
+    match cmd {
+        ReviewCmd::List {
+            repo,
+        } => {
+            let items = crate::review::list(&repo)?;
+            if json {
+                let arr: Vec<_> = items
+                    .iter()
+                    .map(|b| {
+                        serde_json::json!({
+                            "id": b.id.full(), "status": b.status.as_str(),
+                            "review": b.review_state(), "type": b.kind(), "title": b.title,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else if items.is_empty() {
+                println!("(no review items)");
+            } else {
+                println!("{:<9} {:<7} {:<13} {:<8} TITLE", "ID", "STATUS", "REVIEW", "TYPE");
+                for b in &items {
+                    println!(
+                        "{:<9} {:<7} {:<13} {:<8} {}",
+                        &b.id.full()[..7],
+                        b.status.as_str(),
+                        b.review_state().unwrap_or("-"),
+                        b.kind().unwrap_or("-"),
+                        b.title
+                    );
+                }
+            }
+        }
+        ReviewCmd::Show {
+            id,
+            repo,
+        } => {
+            let b = crate::review::show(&repo, &id)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "id": b.id.full(), "title": b.title, "status": b.status.as_str(),
+                        "review": b.review_state(), "type": b.kind(), "author": b.author,
+                        "labels": b.labels, "comments": b.comments.len(),
+                    })
+                );
+            } else {
+                println!("item {}", &b.id.full()[..7]);
+                println!("  title:  {}", b.title);
+                println!(
+                    "  status: {}  (review: {}, type: {})",
+                    b.status.as_str(),
+                    b.review_state().unwrap_or("-"),
+                    b.kind().unwrap_or("-")
+                );
+                println!("  author: {}", b.author.get(..7).unwrap_or(&b.author));
+                if !b.labels.is_empty() {
+                    let labels: Vec<_> = b.labels.iter().cloned().collect();
+                    println!("  labels: {}", labels.join(", "));
+                }
+                println!("  comments ({}):", b.comments.len());
+                for c in &b.comments {
+                    let who = c.author.get(..7).unwrap_or(&c.author);
+                    println!("    [{who}] {}", c.message.lines().next().unwrap_or(""));
+                }
+            }
+        }
+        ReviewCmd::Post {
+            title,
+            message,
+            labels,
+            repo,
+        } => {
+            let labels = if labels.is_empty() {
+                vec!["type:change".to_string(), "review:open".to_string()]
+            } else {
+                labels
+            };
+            let id = crate::review::post(&repo, &title, message.as_deref().unwrap_or(""), &labels)?;
+            if json {
+                println!("{}", serde_json::json!({"id": id.full()}));
+            } else {
+                println!("posted {} [{}]", &id.full()[..7], title);
             }
         }
     }
