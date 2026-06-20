@@ -33,3 +33,5 @@ sha2 = ">=0.10, <0.11"
 # TUI-only — behind the feature so the headless CLI build stays slim:
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
+serde_json_canonicalizer = "0.3.2"
+hex = "0.4"
