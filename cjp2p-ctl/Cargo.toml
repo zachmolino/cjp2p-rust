@@ -33,3 +33,4 @@ crossterm = { version = "0.28", optional = true }
 serde_json_canonicalizer = "0.3.2"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
