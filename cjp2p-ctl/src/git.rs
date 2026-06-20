@@ -105,10 +105,10 @@ pub fn clone_repo(c: &NodeClient, url: &str, dest: Option<&Path>) -> Result<Path
         .context("fetching bundle (the publisher must be reachable as a peer)")?;
     std::fs::write(&tmp, &bytes)?;
 
-    if let Err(e) = run_git(&["bundle", "verify", tmp_s]) {
-        std::fs::remove_file(&tmp).ok();
-        return Err(e).context("bundle failed verification");
-    }
+    // No standalone `git bundle verify` here: it requires an existing repo, and a
+    // fresh clone has none ("need a repository to verify a bundle"). `git clone`
+    // below reads and validates the bundle, failing on corruption — which is the
+    // integrity check that matters for a clone.
 
     let dest = dest.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(&name));
     let dest_s = dest.to_str().ok_or_else(|| anyhow!("non-UTF8 dest"))?;
@@ -135,7 +135,9 @@ pub fn pull_repo(c: &NodeClient, dir: &Path) -> Result<String> {
     let tmp_s = tmp.to_str().ok_or_else(|| anyhow!("non-UTF8 temp path"))?;
     let bytes = c.fetch_bytes(&bundle_server_path(&pub_hex, &name), Duration::from_secs(120))?;
     std::fs::write(&tmp, &bytes)?;
-    if let Err(e) = run_git(&["bundle", "verify", tmp_s]) {
+    // Verify against the existing repo (`-C dir`) so prerequisites are checked
+    // and it works regardless of the caller's cwd.
+    if let Err(e) = run_git(&["-C", dir_s, "bundle", "verify", tmp_s]) {
         std::fs::remove_file(&tmp).ok();
         return Err(e).context("bundle failed verification");
     }
