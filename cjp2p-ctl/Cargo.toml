@@ -34,3 +34,10 @@ serde_json_canonicalizer = "0.3.2"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+# Pure-Rust git (no libgit2/C); default-features off keeps zlib pure-Rust
+# (miniz_oxide) so Android cross-compiles cleanly. Used for the git-bug
+# object/ref read-write layer (bundles still go through the `git` CLI; Task #6).
+gix = { version = "0.84", default-features = false, features = [
+    "max-performance-safe",
+    "sha1",
+] }
