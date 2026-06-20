@@ -7,3 +7,4 @@ pub mod clock;
 pub mod gobytes;
 pub mod id;
 pub mod jcs;
+pub mod store;

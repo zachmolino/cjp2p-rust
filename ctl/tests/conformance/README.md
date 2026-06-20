@@ -41,6 +41,19 @@ Commit `author`/`committer` are empty (` <> `); authorship lives in the pack.
 - a bug's id = its first (`Create`) operation's id.
 - identity id = `hex(sha256(gobytes(identity version)))`.
 
+## Write conformance (cjp2p → git-bug)
+
+`tests/conformance_write.rs` writes a bug with cjp2p's native layer (`store.rs`
++ `gobytes.rs`) and asserts a real `git-bug` reads it back with matching id,
+title, and status. It auto-skips when no git-bug binary is found (PATH /
+`~/go/bin/git-bug` / `GIT_BUG=…`).
+
+**git-bug cache caveat:** git-bug keeps a cache under `.git/git-bug/` keyed by
+ref hashes and does **not** auto-notice a `refs/bugs/*` added out-of-band. After
+writing bugs into a repo a git-bug user already touched, invalidate it
+(`rm -rf .git/git-bug`); git-bug rebuilds on the next command. The objects are
+valid either way — this is only about git-bug's read cache.
+
 ## Regenerate a sample
 
 ```sh
