@@ -113,6 +113,20 @@ pub fn clone_repo(c: &NodeClient, url: &str, dest: Option<&Path>) -> Result<Path
     let dest = dest.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(&name));
     let dest_s = dest.to_str().ok_or_else(|| anyhow!("non-UTF8 dest"))?;
     let res = run_git(&["clone", tmp_s, dest_s]).context("git clone from bundle");
+    if res.is_ok() {
+        // git clone's default refspec only takes refs/heads/*; also pull the
+        // git-bug board refs so a review board (refs/bugs, refs/identities)
+        // rides the clone.
+        run_git(&[
+            "-C",
+            dest_s,
+            "fetch",
+            tmp_s,
+            "refs/bugs/*:refs/bugs/*",
+            "refs/identities/*:refs/identities/*",
+        ])
+        .ok();
+    }
     std::fs::remove_file(&tmp).ok();
     res?;
 
@@ -150,6 +164,10 @@ pub fn pull_repo(c: &NodeClient, dir: &Path) -> Result<String> {
         tmp_s,
         "refs/heads/*:refs/remotes/lcdp/*",
         "refs/tags/*:refs/tags/*",
+        // git-bug board refs, fast-forward-only (no `+`) so concurrent edits are
+        // rejected rather than clobbered — those need a `git bug` merge.
+        "refs/bugs/*:refs/bugs/*",
+        "refs/identities/*:refs/identities/*",
     ])
     .context("git fetch from bundle");
     std::fs::remove_file(&tmp).ok();
