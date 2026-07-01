@@ -361,6 +361,9 @@ impl PeerState {
             },
             socket: (|| -> std::io::Result<UdpSocket> {
                 let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+                // IPV6_ADDR_PREFERENCES (prefer public over temporary source addresses)
+                // is a Linux-only socket option; other platforms just skip the hint.
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 unsafe {
                     let val: libc::c_int = 0x0002; // IPV6_PREFER_SRC_PUBLIC
                     libc::setsockopt(
@@ -1279,11 +1282,24 @@ fn parse_header(stream: &mut TcpStream) -> Option<HttpRequest> {
 
 fn free_disk_bytes() -> u64 {
     unsafe {
-        let mut stat: libc::statvfs64 = std::mem::zeroed();
-        if libc::statvfs64(b".\0".as_ptr() as *const libc::c_char, &mut stat) == 0 {
-            (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
-        } else {
-            0
+        // Linux/Android expose statvfs64; macOS/BSD use plain statvfs (already 64-bit fields).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let mut stat: libc::statvfs64 = std::mem::zeroed();
+            if libc::statvfs64(b".\0".as_ptr() as *const libc::c_char, &mut stat) == 0 {
+                (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
+            } else {
+                0
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let mut stat: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(b".\0".as_ptr() as *const libc::c_char, &mut stat) == 0 {
+                (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
+            } else {
+                0
+            }
         }
     }
 }
@@ -1844,6 +1860,7 @@ fn get_local_ip_for_gateway(gateway_ip: Ipv4Addr) -> Ipv4Addr {
 
 // Find the IPv6 default gateway and its interface index via netlink RTM_GETROUTE.
 // This uses the kernel's routing socket API, which works on Linux and Android alike.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn pcp_find_ipv6_gateway() -> Option<(Ipv6Addr, u32)> {
     use nix::sys::socket::{
         bind, recvfrom, sendto, socket, AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockType,
@@ -1945,6 +1962,13 @@ fn pcp_find_ipv6_gateway() -> Option<(Ipv6Addr, u32)> {
     }
 
     best_gw.map(|gw| (gw, best_oif))
+}
+
+// Non-Linux (e.g. macOS): no netlink routing socket available, so skip PCP IPv6
+// gateway discovery. Outbound connectivity to bootstrap peers is unaffected.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn pcp_find_ipv6_gateway() -> Option<(Ipv6Addr, u32)> {
+    None
 }
 
 // SSDP M-SEARCH for WANIPv6FirewallControl, then parse the device description to get the
