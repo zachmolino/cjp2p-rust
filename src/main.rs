@@ -2463,15 +2463,11 @@ fn handle_line(
                                 EncryptedMessages::new(ps,their_pub, serde_json::to_vec(&message_out).unwrap()),
                                 //FastEncryptedMessages::new(ps,their_pub, serde_json::to_vec(&message_out).unwrap()),
                                 ];
-                        let message_out_bytes: Vec<u8> = serde_json::to_vec(&message_out).unwrap();
-                        trace!( "sending message {:?} to {addr}", String::from_utf8_lossy(&message_out_bytes));
-                        ps.socket.send_to(&message_out_bytes, addr).ok();
-                    } else {
-                        warn!("refusing to send unencrypted 1:1 message.  This probably shouldn't happen.");
                     }
-                } else {
-                    warn!("refusing to send unencrypted 1:1 message.  This probably shouldn't happen.");
                 }
+                let message_out_bytes: Vec<u8> = serde_json::to_vec(&message_out).unwrap();
+                trace!( "sending message {:?} to {addr}", String::from_utf8_lossy(&message_out_bytes));
+                ps.socket.send_to(&message_out_bytes, addr).ok();
             }
         }
     } else if line == "/peers" {
