@@ -23,7 +23,6 @@ If you create .allow_remote_http in the directory you run this, the next time it
 # building (optional)
 
 - https://github.com/kermit4/cjp2p-rust/ 
-- https://app.radicle.xyz/nodes/iris.radicle.xyz/rad:z4NaokAHdQyjkF562Cj9PpHpGH5f1 (but ive seen it a week behind on the same Radical node I was pushing to daily so I'm not sure if this is working right.  It seems to be now, though)
 
 make release
 
