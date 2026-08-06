@@ -282,6 +282,7 @@ struct PeerState {
     http_clients: Vec<TcpStream>,
     content_gateways: Vec<ContentGateway>,
     active_peer_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    active_peer_pubs: HashSet<Ed25519Pub>,
     //probe_peer_history: VecDeque<HashSet<SocketAddr>>,
 }
 #[derive(Serialize, Deserialize)]
@@ -401,6 +402,7 @@ impl PeerState {
             http_clients: Vec::new(),
             content_gateways: Vec::new(),
             active_peer_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            active_peer_pubs: HashSet::new(),
             //probe_peer_history: VecDeque::new(),
         };
         let n = ps.active_peers_from_pub_map().len();
@@ -5101,7 +5103,15 @@ fn maintenance(
     debug!("maintenance");
     ps.next_maintenance = Instant::now()
         + Duration::from_millis(rand::rng().random_range(888..999) * ps.maintenance_period as u64);
-    let n = ps.active_peers_from_pub_map().len();
+    let active_peers = ps.active_peers_from_pub_map();
+    let n = active_peers.len();
+    let new_pubs: HashSet<Ed25519Pub> = active_peers.iter().map(|(_, pub_, _)| *pub_).collect();
+    if n > ps.active_peer_pubs.len() {
+        for pub_ in new_pubs.difference(&ps.active_peer_pubs) {
+            info!("peer count increased to {n}, caused by {pub_}");
+        }
+    }
+    ps.active_peer_pubs = new_pubs;
     ps.active_peer_count
         .store(n, std::sync::atomic::Ordering::Relaxed);
     if let Some(next) = ps.group_chat_backoff_next {
