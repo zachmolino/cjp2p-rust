@@ -1,0 +1,27 @@
+Trust in p2p is a classic hard problem. You’re right that Sybil attacks are the big blocker: if identities are free, an attacker can spin up millions of nodes and swamp any reputation system.
+
+*Common scarcity-based signals people use:*
+Signal  How it works    Pros    Cons
+**Proof-of-Work**   Require CPU/time per identity, like Hashcash    Sybil-resistant, no central authority   Wasteful, bad for mobile/low-power nodes
+**Proof-of-Storage/Space**  Prove you’re storing data over time Used by Filecoin/Chia, ties to real cost    Complex to verify, still can be pooled
+**IP address**  1 IPv4 = 1 identity, or rate-limit per /24  Simple, IPv4 is scarce  IPv6 kills it, NAT/CGNAT breaks it, penalizes multi-user hosts
+**Proof-of-Stake**  Lock up tokens/collateral per node  Strong economic cost to misbehave   Needs a currency, bootstrap problem
+**Web of Trust**    Nodes vouch for each other manually No scarcity needed  Slow bootstrap, doesn’t scale, vulnerable to cliques
+*Reputation without global scarcity:*
+
+1. *Interaction-based*: Track `sent_bytes_acked / sent_bytes_total` per peer. Slowly increase send windows as they prove reliability. BitTorrent’s tit-for-tat is the classic example. No global identity needed, just pairwise history.
+2. *Signed uptime proofs*: Node A asks B to store a nonce, checks later. If B responds, A increases trust. Used in Gnutella2, Freenet.
+3. *Social graphs*: If your p2p app has real users, tie nodes to accounts that humans care about. Signal messenger does this: your phone number is the scarce resource.
+4. *Blockchain-anchored*: Publish a public key + first-seen timestamp to a chain. Cost to register = spam deterrent. Not perfect but raises cost.
+
+*Hybrid that works well for UDP p2p:*  
+Start with zero trust. Every new peer gets a tiny rate limit, like 3 packets/sec. To raise it they must:
+1. Complete a cookie exchange proving they receive at the IP, RFC 6347 style
+2. Solve a small PoW puzzle per epoch, 5-10ms of CPU
+3. Maintain low loss/jitter over time
+
+That combines weak CPU scarcity + reachability proof + behavioral history. Still not Sybil-proof globally, but good enough for DoS resistance per link.
+
+The key insight: you don’t need global trust. You only need enough pairwise trust to decide “should I allocate resources to this peer right now”. Most DHTs and file-sharing nets work that way.
+
+If you tell me what your p2p net does — file storage, messaging, tunneling — I can suggest which pattern fits best.

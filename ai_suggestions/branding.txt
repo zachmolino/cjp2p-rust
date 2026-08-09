@@ -1,0 +1,60 @@
+externally tagged JSON over UDP/WebSockets as a dumb, universal, IP-level carrier. No schema committee, no gatekeepers. Just `[{"type": "...", ...},...]`.
+
+Message-oriented, external type tag, JSON payload, transport-agnostic. That's it. IP for structured messages.
+
+Theme = dead simple, open, bottom-layer, no kings. 
+
+1. *ETJ* - _Externally Tagged JSON_. Direct. Like UDP. `etj://host:port`
+
+Your Rust implementation name
+Needs to be distinct from the protocol. It's _an_ ETJ/Wire implementation, not _the_ protocol. Like `nginx` vs `HTTP`.
+*Rust-y names*
+1. *etjd* - If protocol is ETJ. The daemon/reference impl.
+
+
+hygroden network protocol
+
+Since the baseline is literally `UDP{JSON}`, you can't sell the protocol. You sell everything around it. Same way nginx is free but nginx-the-company isn't homeless:
+So how _do_ you eat with Hydrogen?
+
+1. *Sell the node*  
+   Your WS->UDP gateway. Free for local use, $5/mo for "Hydrogen Node Pro" with: auto-updates, metrics dashboard, `localhost.yourdomain.com` TLS cert baked in, NAT traversal, relay fallback. The permission prompt becomes your upsell: "Want to skip the prompt for all sites? Get Pro."
+
+2. *Sell the infra*  
+   Public Hydrogen relays for when p2p fails. WebRTC TURN servers exist because p2p is a lie 30% of the time. Run `hydrogen-relay.com`, charge per GB or per million packets. Apps embed your relay URL, you bill them.
+
+3. *Sell the SDK/tooling*  
+   Browser lib, Rust/Go libs, debugging UI that shows all your `{"type":...}` flying around. Dev tools are the one thing people pay for even if the protocol is trivial. See: Postman, ngrok.
+
+4. *Sell support to the token guy*  
+   You already know one. The Web3 world _loves_ paying for p2p infra they don't understand. "Hydrogen-compatible" is a buzzword now. Go consult, make them pay you in USDC, keep the protocol MIT.
+
+*The key:* Hydrogen itself stays free, dumb, and un-ownable. You make money because you're the person who understands how to run it without packet loss ruining everyone's day.
+
+Your last boss paid well launching a token. You can probably get him to pay well _not_ launching a token if you phrase it as "decentralized data layer for gaming/messaging/IoT". Same money, fewer SEC filings.
+
+Go eat. Then come back and decide if "Hydrogen Labs" needs a website. Just don't add a `/token` route. I'm watching.
+
+*Existing uses I found:*
+
+1. *IoT/LPWAN "Hydrogen Protocol"*
+   A real thing: "Low Power Wide Area Network roaming and interoperability framework for IoT" that sits on top of LoRa/LoRaWAN. Uses IPv6 + BGP, does device auth/roaming. There's even `hydrogen.plumbing` with hardware and firmware to convert Helium miners.
+   *Collision risk:* Low. Totally different layer. Yours is L4-ish "send JSON", theirs is L3/L2 LPWAN glue.
+
+2. *Crypto "Hydrogen Protocol"*
+   Liquid staking on Blast network. "hsETH", "hsUSDB", DeFi stuff.
+   *Collision risk:* Zero unless you also launch a token. Please don't.
+
+3. *Hydrogen fuel "protocol"*
+   ISO is writing "fueling protocols for liquid hydrogen" for aircraft. Toyota's working on it too.
+   *Collision risk:* Negative. Unless your packets are cryogenic.
+
+
+hygrojen protocol
+
+Yours would be "Hydrogen Protocol (UDP/JSON p2p baseline)". Theirs is "Hydrogen Protocol (LPWAN roaming)" and "Hydrogen Protocol (Blast LSD)". If anyone asks, just say "no, the _good_ one".
+
+Least Common Denominator Protocol
+
+phonetic checked according to meta-ai
+
