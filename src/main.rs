@@ -2289,7 +2289,7 @@ fn run_engine(
                 None => read_fds.contains(stdin.as_fd()),
             };
             if stdin_triggered {
-                info!("handling stdin");
+                debug!("handling stdin");
                 let keep_open = if let Some((pipe_read, rx)) = &tty_state {
                     let mut buf = [0u8; 1];
                     unsafe {
