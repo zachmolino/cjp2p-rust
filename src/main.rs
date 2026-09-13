@@ -825,6 +825,21 @@ impl PeerState {
             }
             return;
         }
+
+        if cg.only_if_cached {
+            // RFC 9111 5.2.1.7: only-if-cached means answer from what's stored or
+            // 504, never start a fetch. The complete-file open above just failed, so
+            // this content isn't held complete. A conservative "no": an in-progress
+            // download in inbound_states doesn't count as cached either -- it may be
+            // wrong (unverified blocks) or may never finish, and letting it through
+            // would mean the caller can't tell "served from cache" from "served from
+            // a fetch that happened to already be running for some other reason".
+            cg.http_socket
+                .write_all(b"HTTP/1.0 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
+                .ok();
+            self.content_gateways.remove(cg_index);
+            return;
+        }
         let id = cg.id.clone();
 
         if let Some(ss) = stream_states.get_mut(&id) {
@@ -1276,6 +1291,18 @@ fn parse_header(stream: &mut TcpStream) -> Option<HttpRequest> {
         headers,
         body_prefix,
     })
+}
+
+// RFC 9111 5.2.1.7: Cache-Control is a comma-separated list of directives,
+// tokens are case-insensitive, and unknown directives are ignored.
+fn has_only_if_cached(headers: &HashMap<String, String>) -> bool {
+    headers
+        .get("cache-control")
+        .map(|v| {
+            v.split(',')
+                .any(|d| d.trim().eq_ignore_ascii_case("only-if-cached"))
+        })
+        .unwrap_or(false)
 }
 
 fn free_disk_bytes() -> u64 {
@@ -3479,6 +3506,7 @@ fn handle_web_request(
                     pending_latest,
                     is_head: req.method == "HEAD",
                     initiator: Initiator::Latest,
+                    only_if_cached: false,
                 });
                 if ps.content_gateways[index].pending_latest.is_none() {
                     ps.serve_http_content(stream_states, inbound_states, index);
@@ -3537,6 +3565,7 @@ fn handle_web_request(
             pending_latest: None,
             is_head: req.method == "HEAD",
             initiator: Initiator::Stream,
+            only_if_cached: false,
         });
         ps.serve_http_content(stream_states, inbound_states, index);
         return;
@@ -3636,6 +3665,7 @@ fn handle_web_request(
         pending_latest: None,
         is_head: req.method == "HEAD",
         initiator: Initiator::ByHash,
+        only_if_cached: has_only_if_cached(&req.headers),
     });
     ps.serve_http_content(stream_states, inbound_states, index);
 }
@@ -4680,6 +4710,11 @@ struct ContentGateway {
     pending_latest: Option<LatestData>,
     is_head: bool,
     initiator: Initiator,
+    // RFC 9111 5.2.1.7 Cache-Control: only-if-cached, ByHash route only -- see
+    // serve_http_content. Latest/Stream already ask peers before a ContentGateway
+    // exists, for reasons unrelated to holding this content, so the directive would
+    // arrive too late there.
+    only_if_cached: bool,
 }
 enum Initiator {
     Latest,
