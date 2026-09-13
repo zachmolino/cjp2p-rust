@@ -826,13 +826,7 @@ impl PeerState {
         }
 
         if cg.only_if_cached {
-            // RFC 9111 5.2.1.7: only-if-cached means answer from what's stored or
-            // 504, never start a fetch. The complete-file open above just failed, so
-            // this content isn't held complete. A conservative "no": an in-progress
-            // download in inbound_states doesn't count as cached either -- it may be
-            // wrong (unverified blocks) or may never finish, and letting it through
-            // would mean the caller can't tell "served from cache" from "served from
-            // a fetch that happened to already be running for some other reason".
+            // An in-progress download is not "cached": its blocks are unverified.
             cg.http_socket
                 .write_all(b"HTTP/1.0 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
                 .ok();
@@ -1292,8 +1286,7 @@ fn parse_header(stream: &mut TcpStream) -> Option<HttpRequest> {
     })
 }
 
-// RFC 9111 5.2.1.7: Cache-Control is a comma-separated list of directives,
-// tokens are case-insensitive, and unknown directives are ignored.
+// RFC 9111 5.2.1.7
 fn has_only_if_cached(headers: &HashMap<String, String>) -> bool {
     headers
         .get("cache-control")
@@ -4596,10 +4589,7 @@ struct ContentGateway {
     eof: Option<usize>,
     pending_latest: Option<LatestData>,
     initiator: Initiator,
-    // RFC 9111 5.2.1.7 Cache-Control: only-if-cached, ByHash route only -- see
-    // serve_http_content. Latest/Stream already ask peers before a ContentGateway
-    // exists, for reasons unrelated to holding this content, so the directive would
-    // arrive too late there.
+    // ByHash only: Latest/Stream ask peers before a ContentGateway exists.
     only_if_cached: bool,
 }
 enum Initiator {
