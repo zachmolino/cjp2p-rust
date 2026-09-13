@@ -4823,9 +4823,21 @@ impl InboundState {
             .map_or(false, |bm| bm.get(block_number))
         {
             debug!("dup {block_number}");
-        } else if content.base64.len() == BLOCK_SIZE!()
-            || content.base64.len() + content.offset == self.eof
+        } else if content.offset == block_number * BLOCK_SIZE!()
+            && content
+                .offset
+                .checked_add(content.base64.len())
+                .map_or(false, |end| end <= self.eof)
         {
+            // WHY: a Content whose offset isn't block-aligned, or whose
+            // offset+len runs past the established eof, used to slip
+            // through here (the old check only required len==BLOCK_SIZE
+            // *or* offset+len==eof, with no bound on offset itself) and
+            // reach the unchecked mmap slice below -- a single spoofed
+            // 4096-byte block at offset=eof-1 panics the whole process.
+            // Every legitimate offset this code ever produces is
+            // block_number*BLOCK_SIZE!() (see PleaseSendContent::new_messages),
+            // so requiring alignment costs nothing real.
             if self.id.starts_with("blake3/") {
                 if self.segment_hashes.is_none() {
                     let hash = &self.id["blake3/".len()..];
@@ -5065,19 +5077,26 @@ impl InboundState {
                         error!("{} hash failed 3 times, giving up!", self.id);
                         self.done = true;
                     } else {
-                        if let Some(arc) = self.verifying_mmap.take() {
-                            match std::sync::Arc::try_unwrap(arc) {
-                                Ok(ro) => match ro.make_mut() {
-                                    Ok(mm) => self.mmap = Some(mm),
-                                    Err(e) => error!("{} make_mut failed: {}", self.id, e),
-                                },
-                                Err(_) => error!("{} arc still has refs on hash failure", self.id),
-                            }
-                        }
-                        let n_blocks = (self.eof + BLOCK_SIZE!() - 1) / BLOCK_SIZE!();
-                        let bp = Self::bitmap_path(&self.id);
-                        fs::remove_file(&bp).ok();
-                        self.bitmap = Some(MmapBitVec::create(&bp, n_blocks, None, &[]).unwrap());
+                        // 0adf562 made eof first-writer-wins so no peer can
+                        // change it mid-download; that's still right, but it
+                        // means a wrong first eof (attacker or otherwise)
+                        // used to stick forever, wedging the download and
+                        // dropping every future Content that carries the
+                        // real eof ("conflicting EOF ... ignoring"). A
+                        // completed-but-failed hash check is the one signal
+                        // that the established eof might itself be the
+                        // problem, so treat it as license to let the *next*
+                        // Content re-establish eof from scratch -- dropping
+                        // mmap/bitmap (rather than just recreating the
+                        // bitmap at the old size) makes receive_content's
+                        // `self.mmap.is_none()` branch take that Content's
+                        // eof unconditionally. Mid-flight peers still can't
+                        // move the goalposts; only a proven-bad full cycle
+                        // reopens the question.
+                        drop(self.verifying_mmap.take());
+                        self.mmap = None;
+                        self.bitmap = None;
+                        fs::remove_file(Self::bitmap_path(&self.id)).ok();
                         self.next_block = 0;
                         self.bytes_complete = 0;
                     }
