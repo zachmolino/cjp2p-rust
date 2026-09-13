@@ -1306,6 +1306,15 @@ fn leaf_cv_in_tree_v2(mmap: &Mmap, block_num: usize) -> Option<[u8; 32]> {
     Some(mmap[leaf_start..leaf_start + 32].try_into().unwrap())
 }
 
+// A one-block tree's leaf is not bound to its root (that root is blake3::hash of the
+// content), so its block is checked against the root instead. None: no such block.
+fn block_matches_tree_v2(tree: &Mmap, root: &str, i: usize, data: &[u8]) -> Option<bool> {
+    if tree.len() == tree_file_size_v2(1) {
+        return (i == 0).then(|| blake3::hash(data).to_hex().as_str() == root);
+    }
+    Some(block_chaining_value(data, (i * BLOCK_SIZE!()) as u64) == leaf_cv_in_tree_v2(tree, i)?)
+}
+
 // Tree file v2 format (64-byte header, then top-down levels, leaves last):
 //   [4 bytes: magic b"B3T\x02"] [28 bytes: reserved] [32 bytes: root hash]
 //   [intermediate levels highest-first, each level including passed-up odd entries]
@@ -1380,14 +1389,11 @@ fn finalize_tree_mmap_v2(mmap: &mut MmapMut, n_leaves: usize) -> Option<blake3::
 
 // Derive n_leaves from a v2 tree file's eof. Walks upward from approximation.
 fn n_leaves_from_tree_v2_eof(eof: usize) -> Option<usize> {
-    if eof < 128 {
+    if eof < tree_file_size_v2(1) {
         return None;
     }
     let target = eof - 60;
-    let mut n = (target.saturating_sub(4)) / 64;
-    if n < 2 {
-        n = 2;
-    }
+    let mut n = (target.saturating_sub(4) / 64).max(1);
     while tree_file_size(n) < target {
         n += 1;
     }
@@ -1398,6 +1404,26 @@ fn n_leaves_from_tree_v2_eof(eof: usize) -> Option<usize> {
         Some(n)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tree_v2_single_block_tests {
+    use super::*;
+
+    #[test]
+    fn one_block_trees_work() {
+        for n in 1..=300 {
+            assert_eq!(n_leaves_from_tree_v2_eof(tree_file_size_v2(n)), Some(n));
+        }
+        for data in [vec![7u8], vec![7u8; 4096]] {
+            let mut t = MmapMut::map_anon(tree_file_size_v2(1)).unwrap();
+            t[64..].copy_from_slice(&block_chaining_value(&data, 0));
+            let (t, root) = (t.make_read_only().unwrap(), blake3::hash(&data).to_hex());
+            assert_eq!(block_matches_tree_v2(&t, &root, 0, &data), Some(true));
+            assert_eq!(block_matches_tree_v2(&t, &root, 0, &data[1..]), Some(false));
+            assert_eq!(block_matches_tree_v2(&t, &root, 1, &data), None);
+        }
     }
 }
 
@@ -4839,11 +4865,13 @@ impl InboundState {
                     debug!("{} not ready but got blake3 content already",self.id);
                     return vec![];
                 };
-                let Some(expected_cv) = leaf_cv_in_tree_v2(tree_mmap, block_number) else {
+                let hash = &self.id["blake3/".len()..];
+                let Some(ok) =
+                    block_matches_tree_v2(tree_mmap, hash, block_number, &content.base64)
+                else {
                     return vec![];
                 };
-                let cv = block_chaining_value(&content.base64, (block_number * BLOCK_SIZE!()) as u64);
-                if cv != expected_cv {
+                if !ok {
                     warn!("{} block {} blake3 CV mismatch, re-requesting", self.id, block_number);
                     self.last_activity = Instant::now();
                     return vec![];
