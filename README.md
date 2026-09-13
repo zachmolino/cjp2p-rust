@@ -21,7 +21,7 @@ If you create .allow_remote_http in the directory you run this, the next time it
 
 If you want to run this privately, for example among a fixed set of peers on a tailnet, and keep it off the wider public network:
 
-- Create .no_bootstrap in the directory you run this and it will not add the built-in public bootstrap peers on startup.
+- Create .no_bootstrap in the directory you run this and it will not add the built-in public bootstrap peers on startup. It also forgets peers saved from earlier runs, so a node that was once public does not keep dialling the peers it met then.
 - Create .no_port_mapping and it will not attempt UPnP or PCP port mapping (no SSDP discovery, no PCP requests, and no periodic re-mapping every 20 minutes).
 - Create .static_peers with one "ip:port" per line (blank lines and lines starting with # are ignored) and it will add those as peers on startup instead.
 
