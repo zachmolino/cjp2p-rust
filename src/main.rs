@@ -1423,23 +1423,27 @@ fn tree_check_subtree(
     }
     let li = 2 * idx;
     let ri = li + 1;
-    if ri >= level_sizes[level - 1] {
-        return tree_check_subtree(data, level_sizes, offsets, level - 1, li, bad);
-    }
     let co = offsets[level - 1];
     let po = offsets[level];
+    // an odd last entry is copied up unmerged, so its parent must equal it
+    let odd = ri >= level_sizes[level - 1];
     let l: [u8; 32] = data[co + li * 32..co + (li + 1) * 32].try_into().unwrap();
-    let r: [u8; 32] = data[co + ri * 32..co + (ri + 1) * 32].try_into().unwrap();
     let p: [u8; 32] = data[po + idx * 32..po + (idx + 1) * 32].try_into().unwrap();
     let l_ok = tree_check_subtree(data, level_sizes, offsets, level - 1, li, bad);
-    let r_ok = tree_check_subtree(data, level_sizes, offsets, level - 1, ri, bad);
-    if merge_subtrees_non_root(&l, &r, Mode::Hash) == p {
+    let r_ok = odd || tree_check_subtree(data, level_sizes, offsets, level - 1, ri, bad);
+    let expected = if odd {
+        l
+    } else {
+        let r: [u8; 32] = data[co + ri * 32..co + (ri + 1) * 32].try_into().unwrap();
+        merge_subtrees_non_root(&l, &r, Mode::Hash)
+    };
+    if expected == p {
         return true;
     }
     bad.insert((po + idx * 32) / BLOCK_SIZE!());
     if l_ok && r_ok {
         bad.insert((co + li * 32) / BLOCK_SIZE!());
-        bad.insert((co + ri * 32) / BLOCK_SIZE!());
+        bad.insert((co + (li + !odd as usize) * 32) / BLOCK_SIZE!());
     }
     false
 }
@@ -1492,7 +1496,54 @@ fn check_tree_v2_data(data: &[u8], expected_hash: &str, n_leaves: usize) -> Vec<
             warn!("check_tree_v2_data: block0 added by tree propagation, actual suspect blocks: {:?}", non_zero_bad);
         }
     }
+    // the top level must merge to the root, or a consistent tree for other content passes
+    let t = offsets[l - 1];
+    let (a, b) = data[t..t + 64].split_at(32);
+    if merge_subtrees_root(a.try_into().unwrap(), b.try_into().unwrap(), Mode::Hash) != expected {
+        warn!("check_tree_v2_data: top level does not merge to the root n_leaves={}", n_leaves);
+        bad.insert(0);
+    }
     bad.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tree_v2_tests {
+    use super::*;
+
+    // The tree file for `content` and its leaf count, built in memory the way
+    // build_tree_from_mmap builds one on disk, so tests need no ./cjp2p directory.
+    fn tree_v2_for(content: &[u8]) -> (MmapMut, usize) {
+        let n_leaves = (content.len() + BLOCK_SIZE!() - 1) / BLOCK_SIZE!();
+        let mut tree = MmapMut::map_anon(tree_file_size_v2(n_leaves)).unwrap();
+        let leaf_base = tree.len() - n_leaves * 32;
+        for (i, block) in content.chunks(BLOCK_SIZE!()).enumerate() {
+            let cv = block_chaining_value(block, (i * BLOCK_SIZE!()) as u64);
+            tree[leaf_base + i * 32..leaf_base + (i + 1) * 32].copy_from_slice(&cv);
+        }
+        if finalize_tree_mmap_v2(&mut tree, n_leaves).is_none() {
+            // one block: nothing to merge, so build_tree_from_mmap writes the content's hash
+            tree[32..64].copy_from_slice(blake3::hash(content).as_bytes());
+        }
+        (tree, n_leaves)
+    }
+
+    #[test]
+    fn forged_trees_fail() {
+        for blocks in [2, 3, 5, 6, 9] {
+            let good: Vec<u8> = (0..blocks * 4096 - 7).map(|i| (i % 251) as u8).collect();
+            let root = blake3::hash(&good).to_hex();
+            let (mut t, n) = tree_v2_for(&good);
+            assert!(check_tree_v2_data(&t, &root, n).is_empty());
+            // a consistent tree for other content, with the wanted root in its header
+            let (mut forged, _) = tree_v2_for(&good.iter().map(|b| b ^ 1).collect::<Vec<u8>>());
+            forged[32..64].copy_from_slice(&t[32..64]);
+            assert!(!check_tree_v2_data(&forged, &root, n).is_empty());
+            // a changed last leaf, which is copied up unmerged when the count is odd
+            let last = t.len() - 1;
+            t[last] ^= 1;
+            assert!(!check_tree_v2_data(&t, &root, n).is_empty());
+        }
+    }
 }
 
 // Build the tree file from a source mmap in one pass.
