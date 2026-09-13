@@ -4645,6 +4645,7 @@ impl ContentGateway {
         // Callers (serve_content_from_disk/_inbound_state/_stream_state) always
         // resolve http_end to a concrete value before calling serve_mmap.
         let mut http_end = self.http_end.expect("http_end resolved before serve_mmap");
+        available_end = available_end.min(http_end);
         if !self.sent_header {
             let mime_type = mimetype_detector::detect(&mmap[0..]);
             // text/x-typescript is a misdetection of plain JS -- the detector pattern-matches
