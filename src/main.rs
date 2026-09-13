@@ -3477,6 +3477,7 @@ fn handle_web_request(
                     sent_header: false,
                     eof: None,
                     pending_latest,
+                    is_head: req.method == "HEAD",
                     initiator: Initiator::Latest,
                 });
                 if ps.content_gateways[index].pending_latest.is_none() {
@@ -3534,6 +3535,7 @@ fn handle_web_request(
             sent_header: false,
             eof: None,
             pending_latest: None,
+            is_head: req.method == "HEAD",
             initiator: Initiator::Stream,
         });
         ps.serve_http_content(stream_states, inbound_states, index);
@@ -3632,6 +3634,7 @@ fn handle_web_request(
         sent_header: false,
         eof: None,
         pending_latest: None,
+        is_head: req.method == "HEAD",
         initiator: Initiator::ByHash,
     });
     ps.serve_http_content(stream_states, inbound_states, index);
@@ -4675,6 +4678,7 @@ struct ContentGateway {
     sent_header: bool,
     eof: Option<usize>,
     pending_latest: Option<LatestData>,
+    is_head: bool,
     initiator: Initiator,
 }
 enum Initiator {
@@ -4820,6 +4824,11 @@ impl ContentGateway {
                 }
             }
             self.sent_header = true;
+            if self.is_head {
+                self.http_done = true;
+                self.waiting_for_browser = false;
+                return;
+            }
         }
 
         debug!("cg {} serve_mmap {}-{} [available {} ] of {}",self.http_socket.as_raw_fd(),self.http_start,http_end,available_end,self.eof.unwrap_or(0x7fffffffff));
