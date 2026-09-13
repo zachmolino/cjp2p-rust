@@ -19,6 +19,12 @@ This will make available any files in the directory ./cj2p/public  It will ignor
 
 If you create .allow_remote_http in the directory you run this, the next time it starts it will allow any IP to connect to the HTTP port, but it will only serve files you already have, it can't cause it to download anything new, and doesn't have any of special access that localhost does. As of this writing that means it will refuse websockets too. I run it with .allow_remote_http so I think its safe, but I have no crypto keys laying around to worry about.
 
+If you want to run this privately, for example among a fixed set of peers on a tailnet, and keep it off the wider public network:
+
+- Create .no_bootstrap in the directory you run this and it will not add the built-in public bootstrap peers on startup.
+- Create .no_port_mapping and it will not attempt UPnP or PCP port mapping (no SSDP discovery, no PCP requests, and no periodic re-mapping every 20 minutes).
+- Create .static_peers with one "ip:port" per line (blank lines and lines starting with # are ignored) and it will add those as peers on startup instead.
+
 
 # building (optional)
 
