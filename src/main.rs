@@ -3174,6 +3174,7 @@ fn handle_web_request(
     };
     let mut start: usize = 0;
     let mut end: usize = 0;
+    let mut end_given = false;
     if req.path == "/" {
         debug!("got http request for {:?}",req);
         status_page(inbound_states, ps, stream);
@@ -3316,10 +3317,11 @@ fn handle_web_request(
                 );
                 let mut start: usize = 0;
                 let mut end: usize = 0;
+                let mut end_given = false;
                 let mut ranged = false;
                 if let Some(range) = req.headers.get("range") {
-                    sscanf!(range, "bytes={}-{}", start, end).ok();
-                    if end > 0 { end+=1; }
+                    end_given = sscanf!(range, "bytes={}-{}", start, end).is_ok();
+                    if end_given { end += 1; }
                     info!("got ranged http req {} range {:?}",req.path,range);
                     ranged = true;
                 } else {
@@ -3371,7 +3373,7 @@ fn handle_web_request(
                 ps.content_gateways.push(ContentGateway {
                     id: sha256_opt.unwrap_or_default(),
                     http_start: start,
-                    http_end: end,
+                    http_end: if end_given { Some(end) } else { None },
                     ranged: ranged,
                     http_socket: stream,
                     waiting_for_browser: false,
@@ -3416,8 +3418,8 @@ fn handle_web_request(
         let mut ranged = false;
         if let Some(range) = req.headers.get("range") {
             info!("got ranged http req {} range {:?}",req.path,range);
-            sscanf!(range, "bytes={}-{}",start,end).ok();
-            if end > 0 { end+=1; }
+            end_given = sscanf!(range, "bytes={}-{}",start,end).is_ok();
+            if end_given { end+=1; }
             ranged = true;
         } else {
             info!("got unranged http req {} start/end {} {} {:?} ",req.path,start,end,req.headers);
@@ -3428,7 +3430,7 @@ fn handle_web_request(
         ps.content_gateways.push(ContentGateway {
             id: full_id,
             http_start: start,
-            http_end: if end != 0 { end } else { 0x7fffffffff },
+            http_end: if end_given { Some(end) } else { None },
             http_socket: stream,
             ranged: ranged,
             waiting_for_browser: false,
@@ -3488,8 +3490,8 @@ fn handle_web_request(
     let mut ranged = false;
     if let Some(range) = req.headers.get("range") {
         info!("got ranged http req {} range {:?}",req.path,range);
-        sscanf!(range, "bytes={}-{}",start,end).ok();
-        if end > 0 { end+=1; }
+        end_given = sscanf!(range, "bytes={}-{}",start,end).is_ok();
+        if end_given { end+=1; }
         ranged = true;
     } else {
         info!("got unranged http req {} start/end {} {} {:?} ",req.path,start,end,req.headers);
@@ -3526,7 +3528,7 @@ fn handle_web_request(
     ps.content_gateways.push(ContentGateway {
         id: content_id,
         http_start: start,
-        http_end: end,
+        http_end: if end_given { Some(end) } else { None },
         ranged: ranged,
         http_socket: stream,
         waiting_for_browser: false,
@@ -3895,7 +3897,7 @@ impl PleaseSendContent {
                 if new_next_block != i.next_block
                     && (i.next_block * BLOCK_SIZE!() < cg.http_start
                         || i.next_block * BLOCK_SIZE!() >= cg.http_start + 0x400000
-                        || i.next_block * BLOCK_SIZE!() > cg.http_end)
+                        || i.next_block * BLOCK_SIZE!() > cg.http_end.unwrap_or(usize::MAX))
                 {
                     info!("http {} ressetting next_block from {} to {} !",line!(), i.next_block,new_next_block);
                     i.next_block = new_next_block;
@@ -4557,7 +4559,10 @@ struct ContentGateway {
     id: String,
     ///http_time: Instant,
     http_start: usize,
-    http_end: usize,
+    // None means "no end given in the Range header, serve to EOF" -- 0 is a
+    // legitimate last-byte-pos (bytes=0-0 means "just byte 0"), so it can't
+    // also be the sentinel for "unspecified" the way it used to be.
+    http_end: Option<usize>,
     ranged: bool,
     http_socket: TcpStream,
     waiting_for_browser: bool,
@@ -4577,12 +4582,11 @@ impl ContentGateway {
         if self.eof.is_none() {
             self.eof = Some(file.metadata().unwrap().len() as usize);
         }
-        if self.http_end == 0 || self.eof.unwrap() < self.http_end {
-            self.http_end = self.eof.unwrap();
-        }
+        // No end given, or a given end past eof: clamp to eof.
+        self.http_end = Some(self.http_end.map_or(self.eof.unwrap(), |e| e.min(self.eof.unwrap())));
         // i couldnt figure out how to get serve_mmap to take both Mmap or MmapMut.
         let mmap = unsafe { MmapMut::map_mut(file).unwrap() };
-        self.serve_mmap(&mmap, self.http_end);
+        self.serve_mmap(&mmap, self.http_end.unwrap());
     }
 
     fn serve_content_from_inbound_state(&mut self, i: &mut InboundState) {
@@ -4591,13 +4595,12 @@ impl ContentGateway {
             return;
         }
         self.eof = Some(i.eof);
-        if self.http_end == 0 || self.eof.unwrap() < self.http_end {
-            self.http_end = self.eof.unwrap();
-        }
+        // No end given, or a given end past eof: clamp to eof.
+        self.http_end = Some(self.http_end.map_or(i.eof, |e| e.min(i.eof)));
 
-        let mut available_end = self.http_end;
+        let mut available_end = self.http_end.unwrap();
         if let Some(not_available) = ((self.http_start / BLOCK_SIZE!())
-            ..((self.http_end + (BLOCK_SIZE!() - 1)) / BLOCK_SIZE!()))
+            ..((self.http_end.unwrap() + (BLOCK_SIZE!() - 1)) / BLOCK_SIZE!()))
             .find(|&blk| i.bitmap.as_ref().map_or(true, |bm| !bm.get(blk)))
         {
             available_end = not_available * BLOCK_SIZE!();
@@ -4618,6 +4621,11 @@ impl ContentGateway {
     }
     fn serve_content_from_stream_state(&mut self, ss: &mut StreamState) {
         ss.last_viewed = Instant::now();
+        // A live stream has no fixed eof to clamp an unspecified end to yet;
+        // available_end (from what's downloaded so far) bounds it instead.
+        if self.http_end.is_none() {
+            self.http_end = Some(0x7fffffffff);
+        }
         let start_block = self.http_start / BLOCK_SIZE!();
         let mut available_end = match ss.first_zero_from(start_block) {
             Some(zero_block) => zero_block * BLOCK_SIZE!(),
@@ -4634,6 +4642,9 @@ impl ContentGateway {
         self.serve_mmap(mmap, available_end);
     }
     fn serve_mmap(&mut self, mmap: &[u8], mut available_end: usize) {
+        // Callers (serve_content_from_disk/_inbound_state/_stream_state) always
+        // resolve http_end to a concrete value before calling serve_mmap.
+        let mut http_end = self.http_end.expect("http_end resolved before serve_mmap");
         if !self.sent_header {
             let mime_type = mimetype_detector::detect(&mmap[0..]);
             // text/x-typescript is a misdetection of plain JS -- the detector pattern-matches
@@ -4644,12 +4655,13 @@ impl ContentGateway {
                 mime_type.mime()
             };
             let response = if self.ranged {
-                debug!("cg {} serve_mmap ranged {}-{} of {} {}",self.http_socket.as_raw_fd(),self.http_start,self.http_end,self.eof.unwrap_or(0x7fffffffff),mime_str);
-                debug!("cg {} http end minus start {}",self.http_socket.as_raw_fd(),self.http_end-self.http_start);
-                if self.http_end - self.http_start > 0x100000 {
-                    self.http_end = self.http_start + 0x100000;
-                    if available_end > self.http_end {
-                        available_end = self.http_end;
+                debug!("cg {} serve_mmap ranged {}-{} of {} {}",self.http_socket.as_raw_fd(),self.http_start,http_end,self.eof.unwrap_or(0x7fffffffff),mime_str);
+                debug!("cg {} http end minus start {}",self.http_socket.as_raw_fd(),http_end-self.http_start);
+                if http_end - self.http_start > 0x100000 {
+                    http_end = self.http_start + 0x100000;
+                    self.http_end = Some(http_end);
+                    if available_end > http_end {
+                        available_end = http_end;
                     }
                 } // seems to improve seeking in Brave
                 format!(
@@ -4660,9 +4672,9 @@ impl ContentGateway {
                          Accept-Ranges: bytes\r\n\
                          Content-Range: bytes {}-{}/{}\r\n\
                          Content-Type: {}\r\n\r\n"
-            ,self.http_end-self.http_start,self.http_start,self.http_end-1, self.eof.unwrap_or(0x7fffffffff), mime_str)
+            ,http_end-self.http_start,self.http_start,http_end-1, self.eof.unwrap_or(0x7fffffffff), mime_str)
             } else {
-                debug!("cg {} serve_mmap unranged {}-{} of {} {}",self.http_socket.as_raw_fd(),self.http_start,self.http_end,self.eof.unwrap_or(0x7fffffffff),mime_str);
+                debug!("cg {} serve_mmap unranged {}-{} of {} {}",self.http_socket.as_raw_fd(),self.http_start,http_end,self.eof.unwrap_or(0x7fffffffff),mime_str);
                 format!(
                         "HTTP/1.0 200 OK\r\n\
                          Connection: keep-alive\r\n\
@@ -4670,7 +4682,7 @@ impl ContentGateway {
                          Content-Disposition: inline\r\n\
                          Accept-Ranges: bytes\r\n\
                          Content-Type: {}\r\n\r\n"
-            ,self.http_end-self.http_start, mime_str)
+            ,http_end-self.http_start, mime_str)
             };
             info!("cg {} sending http client {}",self.http_socket.as_raw_fd(),response);
             match self.http_socket.write_all(response.as_bytes()) {
@@ -4684,7 +4696,7 @@ impl ContentGateway {
             self.sent_header = true;
         }
 
-        debug!("cg {} serve_mmap {}-{} [available {} ] of {}",self.http_socket.as_raw_fd(),self.http_start,self.http_end,available_end,self.eof.unwrap_or(0x7fffffffff));
+        debug!("cg {} serve_mmap {}-{} [available {} ] of {}",self.http_socket.as_raw_fd(),self.http_start,http_end,available_end,self.eof.unwrap_or(0x7fffffffff));
         match self
             .http_socket
             .write(&mmap[self.http_start..available_end])
@@ -4707,7 +4719,7 @@ impl ContentGateway {
         } else {
             debug!("cg {} sent up to {} ",self.http_socket.as_raw_fd(),self.http_start);
         }
-        self.http_done = self.http_start == self.http_end;
+        self.http_done = self.http_start == http_end;
         self.waiting_for_browser = self.http_start != available_end;
     }
 }
