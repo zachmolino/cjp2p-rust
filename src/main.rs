@@ -1547,6 +1547,48 @@ fn create_tree_for_file(file_path: &str) -> Option<String> {
     build_tree_from_mmap(&src, file_size, None)
 }
 
+// The tree v2 root is blake3::hash of the content, which is why blake3/<x> and
+// blake3_tree_v2/<x> share a digest. Pin that, and the tree file bytes for a few inputs.
+#[cfg(test)]
+mod tree_v2_root_contract_tests {
+    use super::*;
+
+    #[test]
+    fn tree_root_is_blake3_of_the_content() {
+        // tree file hashes for the first seven lengths
+        let tree_hashes = [
+            "f9bdfcba1505cc664da89bd5df105be977f92897b086075d8f5a1f269b558617",
+            "522ea88ecf2d1e1aac04999a7aedd94737f9fb7103845514a9e40e9debb3aaaa",
+            "87f802b424302b94c4868dc06198717fdf4ab560e0222e4aad97a17cecbd5acd",
+            "5d48cc4c90539edbc02964d82e6afc66c488c64aa9e61c502d8cee2b7d626a4d",
+            "12b0d11acc8d51874e79b02b88bde5245539cd838e4838dda0bfbe8d2a35a5c8",
+            "6e0289148cd873e7e767f59b3696b6f886731952599051b0e08fac2a8b2796dc",
+            "2889acac4c8013e2e03dbe27ea48675b9da9b61e904ffcceb39271bbe9a7f587",
+        ];
+        let lens = [
+            1, 4096, 4097, 12288, 20487, 36864, 4096003, 4095, 8192, 8193, 69627,
+        ];
+        for (k, len) in lens.into_iter().enumerate() {
+            let data: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+                .collect();
+            let n = (len + BLOCK_SIZE!() - 1) / BLOCK_SIZE!();
+            let mut t = MmapMut::map_anon(tree_file_size_v2(n)).unwrap();
+            let base = t.len() - n * 32;
+            for (i, c) in data.chunks(BLOCK_SIZE!()).enumerate() {
+                let cv = block_chaining_value(c, (i * BLOCK_SIZE!()) as u64);
+                t[base + i * 32..base + (i + 1) * 32].copy_from_slice(&cv);
+            }
+            let root = finalize_tree_mmap_v2(&mut t, n).unwrap_or_else(|| blake3::hash(&data));
+            t[32..64].copy_from_slice(root.as_bytes());
+            assert_eq!(root, blake3::hash(&data), "len={len}");
+            if let Some(hash) = tree_hashes.get(k) {
+                assert_eq!(blake3::hash(&t).to_hex().as_str(), *hash, "len={len}");
+            }
+        }
+    }
+}
+
 // After a sha256 download completes, write its tree and link the blake3 path.
 // Hard link is tried first; symlink as fallback; if both fail (e.g. cross-fs on
 // Android) the tree still lands so a future blake3 InboundState can use it.
