@@ -1277,6 +1277,43 @@ fn parse_header(stream: &mut TcpStream) -> Option<HttpRequest> {
     })
 }
 
+// The first byte and the exclusive end a Range header value asks for. The end is None
+// when the header gives no last-byte-pos, because bytes=0-0 asks for byte 0 alone.
+// None for anything else (a suffix range like bytes=-500, several ranges, junk): the
+// caller then ignores the header and sends the whole file, as RFC 9110 14.2 allows,
+// rather than a 206 for bytes the client did not ask for.
+fn parse_range_header(range: &str) -> Option<(usize, Option<usize>)> {
+    let (first, last) = range.trim().strip_prefix("bytes=")?.split_once('-')?;
+    let first_byte: usize = first.trim().parse().ok()?;
+    let last = last.trim();
+    if last.is_empty() {
+        return Some((first_byte, None));
+    }
+    let last_byte: usize = last.parse().ok()?;
+    Some((first_byte, Some(last_byte.saturating_add(1))))
+}
+
+#[cfg(test)]
+mod http_range_tests {
+    use super::*;
+
+    #[test]
+    fn range_header_end_is_exclusive_and_optional() {
+        assert_eq!(parse_range_header("bytes=0-0"), Some((0, Some(1))));
+        assert_eq!(parse_range_header("bytes=5-2"), Some((5, Some(3))));
+        assert_eq!(parse_range_header("bytes=100-199"), Some((100, Some(200))));
+        assert_eq!(parse_range_header("bytes=100-"), Some((100, None)));
+        assert_eq!(
+            parse_range_header("bytes=0-18446744073709551615"),
+            Some((0, Some(usize::MAX)))
+        );
+        // not supported, so the header is ignored
+        assert_eq!(parse_range_header("bytes=-500"), None);
+        assert_eq!(parse_range_header("bytes=0-1,5-6"), None);
+        assert_eq!(parse_range_header("items=0-1"), None);
+    }
+}
+
 fn free_disk_bytes() -> u64 {
     unsafe {
         let mut stat: libc::statvfs64 = std::mem::zeroed();
@@ -3172,8 +3209,6 @@ fn handle_web_request(
     let Some(req) = parse_header(&mut stream) else {
         return;
     };
-    let mut start: usize = 0;
-    let mut end: usize = 0;
     if req.path == "/" {
         debug!("got http request for {:?}",req);
         status_page(inbound_states, ps, stream);
@@ -3314,17 +3349,6 @@ fn handle_web_request(
                     inbound_states,
                     None,
                 );
-                let mut start: usize = 0;
-                let mut end: usize = 0;
-                let mut ranged = false;
-                if let Some(range) = req.headers.get("range") {
-                    sscanf!(range, "bytes={}-{}", start, end).ok();
-                    if end > 0 { end+=1; }
-                    info!("got ranged http req {} range {:?}",req.path,range);
-                    ranged = true;
-                } else {
-                    info!("got unranged http req {} start/end {} {} {:?} ",req.path,start,end,req.headers);
-                }
                 let cache_path = latest_cache_path(&ed25519.to_string(), &name);
                 let sha256_opt = load_sha256_from_latest_cache(&cache_path);
                 if !is_local(&stream) && sha256_opt.is_none() {
@@ -3368,19 +3392,13 @@ fn handle_web_request(
                     }
                 }
                 let index = ps.content_gateways.len();
-                ps.content_gateways.push(ContentGateway {
-                    id: sha256_opt.unwrap_or_default(),
-                    http_start: start,
-                    http_end: end,
-                    ranged: ranged,
-                    http_socket: stream,
-                    waiting_for_browser: false,
-                    http_done: false,
-                    sent_header: false,
-                    eof: None,
+                ps.content_gateways.push(ContentGateway::new(
+                    sha256_opt.unwrap_or_default(),
+                    &req,
+                    stream,
+                    Initiator::Latest,
                     pending_latest,
-                    initiator: Initiator::Latest,
-                });
+                ));
                 if ps.content_gateways[index].pending_latest.is_none() {
                     ps.serve_http_content(stream_states, inbound_states, index);
                 }
@@ -3413,31 +3431,14 @@ fn handle_web_request(
             let peers = ps.best_peers(250, 6);
             ss.request_blocks(ps, peers);
         }
-        let mut ranged = false;
-        if let Some(range) = req.headers.get("range") {
-            info!("got ranged http req {} range {:?}",req.path,range);
-            sscanf!(range, "bytes={}-{}",start,end).ok();
-            if end > 0 { end+=1; }
-            ranged = true;
-        } else {
-            info!("got unranged http req {} start/end {} {} {:?} ",req.path,start,end,req.headers);
-        }
-
-        info!("http start end {start} {end}");
         let index = ps.content_gateways.len();
-        ps.content_gateways.push(ContentGateway {
-            id: full_id,
-            http_start: start,
-            http_end: if end != 0 { end } else { 0x7fffffffff },
-            http_socket: stream,
-            ranged: ranged,
-            waiting_for_browser: false,
-            http_done: false,
-            sent_header: false,
-            eof: None,
-            pending_latest: None,
-            initiator: Initiator::Stream,
-        });
+        ps.content_gateways.push(ContentGateway::new(
+            full_id,
+            &req,
+            stream,
+            Initiator::Stream,
+            None,
+        ));
         ps.serve_http_content(stream_states, inbound_states, index);
         return;
     }
@@ -3485,16 +3486,6 @@ fn handle_web_request(
         return;
     }
 
-    let mut ranged = false;
-    if let Some(range) = req.headers.get("range") {
-        info!("got ranged http req {} range {:?}",req.path,range);
-        sscanf!(range, "bytes={}-{}",start,end).ok();
-        if end > 0 { end+=1; }
-        ranged = true;
-    } else {
-        info!("got unranged http req {} start/end {} {} {:?} ",req.path,start,end,req.headers);
-    }
-
     let content_id: String = if req.path.starts_with("/blake3/") {
         let hash = req.path[8..]
             .split('?')
@@ -3521,21 +3512,14 @@ fn handle_web_request(
         }
         id.to_string()
     };
-    info!("http start end {start} {end}");
     let index = ps.content_gateways.len();
-    ps.content_gateways.push(ContentGateway {
-        id: content_id,
-        http_start: start,
-        http_end: end,
-        ranged: ranged,
-        http_socket: stream,
-        waiting_for_browser: false,
-        http_done: false,
-        sent_header: false,
-        eof: None,
-        pending_latest: None,
-        initiator: Initiator::ByHash,
-    });
+    ps.content_gateways.push(ContentGateway::new(
+        content_id,
+        &req,
+        stream,
+        Initiator::ByHash,
+        None,
+    ));
     ps.serve_http_content(stream_states, inbound_states, index);
 }
 fn handle_network(
@@ -3895,7 +3879,7 @@ impl PleaseSendContent {
                 if new_next_block != i.next_block
                     && (i.next_block * BLOCK_SIZE!() < cg.http_start
                         || i.next_block * BLOCK_SIZE!() >= cg.http_start + 0x400000
-                        || i.next_block * BLOCK_SIZE!() > cg.http_end)
+                        || i.next_block * BLOCK_SIZE!() > cg.http_end.unwrap_or(usize::MAX))
                 {
                     info!("http {} ressetting next_block from {} to {} !",line!(), i.next_block,new_next_block);
                     i.next_block = new_next_block;
@@ -4557,7 +4541,10 @@ struct ContentGateway {
     id: String,
     ///http_time: Instant,
     http_start: usize,
-    http_end: usize,
+    // None means "no end given in the Range header, serve to EOF" -- 0 is a
+    // legitimate last-byte-pos (bytes=0-0 means "just byte 0"), so it can't
+    // also be the sentinel for "unspecified" the way it used to be.
+    http_end: Option<usize>,
     ranged: bool,
     http_socket: TcpStream,
     waiting_for_browser: bool,
@@ -4573,16 +4560,53 @@ enum Initiator {
     ByHash,
 }
 impl ContentGateway {
+    // A gateway for one of the content routes. All three read the request here, so a
+    // Range header means the same thing whichever route it arrives on.
+    fn new(
+        id: String,
+        req: &HttpRequest,
+        http_socket: TcpStream,
+        initiator: Initiator,
+        pending_latest: Option<LatestData>,
+    ) -> ContentGateway {
+        let range_header = req.headers.get("range");
+        let range = range_header.and_then(|value| parse_range_header(value));
+        info!("http req {} range {:?} parsed as {:?}", req.path, range_header, range);
+        let (http_start, http_end) = range.unwrap_or((0, None));
+        ContentGateway {
+            id,
+            http_start,
+            http_end,
+            ranged: range.is_some(),
+            http_socket,
+            waiting_for_browser: false,
+            http_done: false,
+            sent_header: false,
+            eof: None,
+            pending_latest,
+            initiator,
+        }
+    }
+
+    // Resolves http_end against the content's eof: no end given, or a given end past
+    // eof, means eof. Returns the resolved end.
+    fn clamp_end_to_eof(&mut self, eof: usize) -> usize {
+        let http_end = match self.http_end {
+            Some(end) => end.min(eof),
+            None => eof,
+        };
+        self.http_end = Some(http_end);
+        http_end
+    }
+
     fn serve_content_from_disk(&mut self, file: &File) {
         if self.eof.is_none() {
             self.eof = Some(file.metadata().unwrap().len() as usize);
         }
-        if self.http_end == 0 || self.eof.unwrap() < self.http_end {
-            self.http_end = self.eof.unwrap();
-        }
+        let http_end = self.clamp_end_to_eof(self.eof.unwrap());
         // i couldnt figure out how to get serve_mmap to take both Mmap or MmapMut.
         let mmap = unsafe { MmapMut::map_mut(file).unwrap() };
-        self.serve_mmap(&mmap, self.http_end);
+        self.serve_mmap(&mmap, http_end);
     }
 
     fn serve_content_from_inbound_state(&mut self, i: &mut InboundState) {
@@ -4591,13 +4615,11 @@ impl ContentGateway {
             return;
         }
         self.eof = Some(i.eof);
-        if self.http_end == 0 || self.eof.unwrap() < self.http_end {
-            self.http_end = self.eof.unwrap();
-        }
+        let http_end = self.clamp_end_to_eof(i.eof);
 
-        let mut available_end = self.http_end;
+        let mut available_end = http_end;
         if let Some(not_available) = ((self.http_start / BLOCK_SIZE!())
-            ..((self.http_end + (BLOCK_SIZE!() - 1)) / BLOCK_SIZE!()))
+            ..((http_end + (BLOCK_SIZE!() - 1)) / BLOCK_SIZE!()))
             .find(|&blk| i.bitmap.as_ref().map_or(true, |bm| !bm.get(blk)))
         {
             available_end = not_available * BLOCK_SIZE!();
@@ -4618,12 +4640,17 @@ impl ContentGateway {
     }
     fn serve_content_from_stream_state(&mut self, ss: &mut StreamState) {
         ss.last_viewed = Instant::now();
+        // A live stream has no fixed eof to clamp an unspecified end to yet;
+        // available_end (from what's downloaded so far) bounds it instead.
+        let http_end = *self.http_end.get_or_insert(0x7fffffffff);
         let start_block = self.http_start / BLOCK_SIZE!();
         let mut available_end = match ss.first_zero_from(start_block) {
             Some(zero_block) => zero_block * BLOCK_SIZE!(),
             None => ss.data_file_len,
         };
         if available_end > ss.data_file_len { available_end = ss.data_file_len; };
+        // a bounded range stops at its end, however much more of the stream has arrived
+        available_end = available_end.min(http_end);
         debug!("cgss http_start {} eof {} available_end {available_end}",self.http_start,ss.eof);
         if available_end <= self.http_start {
             self.waiting_for_browser = false;
@@ -4634,6 +4661,9 @@ impl ContentGateway {
         self.serve_mmap(mmap, available_end);
     }
     fn serve_mmap(&mut self, mmap: &[u8], mut available_end: usize) {
+        // Callers (serve_content_from_disk/_inbound_state/_stream_state) always
+        // resolve http_end to a concrete value before calling serve_mmap.
+        let mut http_end = self.http_end.expect("http_end resolved before serve_mmap");
         if !self.sent_header {
             let mime_type = mimetype_detector::detect(&mmap[0..]);
             // text/x-typescript is a misdetection of plain JS -- the detector pattern-matches
@@ -4644,12 +4674,13 @@ impl ContentGateway {
                 mime_type.mime()
             };
             let response = if self.ranged {
-                debug!("cg {} serve_mmap ranged {}-{} of {} {}",self.http_socket.as_raw_fd(),self.http_start,self.http_end,self.eof.unwrap_or(0x7fffffffff),mime_str);
-                debug!("cg {} http end minus start {}",self.http_socket.as_raw_fd(),self.http_end-self.http_start);
-                if self.http_end - self.http_start > 0x100000 {
-                    self.http_end = self.http_start + 0x100000;
-                    if available_end > self.http_end {
-                        available_end = self.http_end;
+                debug!("cg {} serve_mmap ranged {}-{} of {} {}",self.http_socket.as_raw_fd(),self.http_start,http_end,self.eof.unwrap_or(0x7fffffffff),mime_str);
+                debug!("cg {} http end minus start {}",self.http_socket.as_raw_fd(),http_end-self.http_start);
+                if http_end - self.http_start > 0x100000 {
+                    http_end = self.http_start + 0x100000;
+                    self.http_end = Some(http_end);
+                    if available_end > http_end {
+                        available_end = http_end;
                     }
                 } // seems to improve seeking in Brave
                 format!(
@@ -4660,9 +4691,9 @@ impl ContentGateway {
                          Accept-Ranges: bytes\r\n\
                          Content-Range: bytes {}-{}/{}\r\n\
                          Content-Type: {}\r\n\r\n"
-            ,self.http_end-self.http_start,self.http_start,self.http_end-1, self.eof.unwrap_or(0x7fffffffff), mime_str)
+            ,http_end-self.http_start,self.http_start,http_end-1, self.eof.unwrap_or(0x7fffffffff), mime_str)
             } else {
-                debug!("cg {} serve_mmap unranged {}-{} of {} {}",self.http_socket.as_raw_fd(),self.http_start,self.http_end,self.eof.unwrap_or(0x7fffffffff),mime_str);
+                debug!("cg {} serve_mmap unranged {}-{} of {} {}",self.http_socket.as_raw_fd(),self.http_start,http_end,self.eof.unwrap_or(0x7fffffffff),mime_str);
                 format!(
                         "HTTP/1.0 200 OK\r\n\
                          Connection: keep-alive\r\n\
@@ -4670,7 +4701,7 @@ impl ContentGateway {
                          Content-Disposition: inline\r\n\
                          Accept-Ranges: bytes\r\n\
                          Content-Type: {}\r\n\r\n"
-            ,self.http_end-self.http_start, mime_str)
+            ,http_end-self.http_start, mime_str)
             };
             info!("cg {} sending http client {}",self.http_socket.as_raw_fd(),response);
             match self.http_socket.write_all(response.as_bytes()) {
@@ -4684,7 +4715,7 @@ impl ContentGateway {
             self.sent_header = true;
         }
 
-        debug!("cg {} serve_mmap {}-{} [available {} ] of {}",self.http_socket.as_raw_fd(),self.http_start,self.http_end,available_end,self.eof.unwrap_or(0x7fffffffff));
+        debug!("cg {} serve_mmap {}-{} [available {} ] of {}",self.http_socket.as_raw_fd(),self.http_start,http_end,available_end,self.eof.unwrap_or(0x7fffffffff));
         match self
             .http_socket
             .write(&mmap[self.http_start..available_end])
@@ -4707,7 +4738,7 @@ impl ContentGateway {
         } else {
             debug!("cg {} sent up to {} ",self.http_socket.as_raw_fd(),self.http_start);
         }
-        self.http_done = self.http_start == self.http_end;
+        self.http_done = self.http_start == http_end;
         self.waiting_for_browser = self.http_start != available_end;
     }
 }
