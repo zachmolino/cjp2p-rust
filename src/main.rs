@@ -445,6 +445,11 @@ impl PeerState {
             ] {
                 ps.add_known_peer(bootstrap.parse().unwrap());
             }
+        } else {
+            // Private mode: discard persisted peers from previous public runs
+            // before loading static peers from .static_peers
+            ps.peer_map.clear();
+            ps.peer_map_by_pub.clear();
         }
         // .static_peers: one "ip:port" per line, for private deployments (e.g. a fixed
         // set of peers on a tailnet) that don't want the public bootstrap list above.
