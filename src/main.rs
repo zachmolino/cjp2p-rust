@@ -1306,6 +1306,13 @@ fn leaf_cv_in_tree_v2(mmap: &Mmap, block_num: usize) -> Option<[u8; 32]> {
     Some(mmap[leaf_start..leaf_start + 32].try_into().unwrap())
 }
 
+// Reserved header bytes 4..8 and 8..16 record the block size and content length (LE).
+// Zero means unknown, so older trees and nodes that ignore the fields still work.
+fn write_tree_v2_header_fields(tree: &mut [u8], content_len: u64) {
+    tree[4..8].copy_from_slice(&(BLOCK_SIZE!() as u32).to_le_bytes());
+    tree[8..16].copy_from_slice(&content_len.to_le_bytes());
+}
+
 // Tree file v2 format (64-byte header, then top-down levels, leaves last):
 //   [4 bytes: magic b"B3T\x02"] [28 bytes: reserved] [32 bytes: root hash]
 //   [intermediate levels highest-first, each level including passed-up odd entries]
@@ -1455,6 +1462,13 @@ fn check_tree_v2_data(data: &[u8], expected_hash: &str, n_leaves: usize) -> Vec<
         warn!("check_tree_v2_data: root hash mismatch in block0 header: stored={} expected={} n_leaves={} len={}", hex::encode(&data[32..64]), expected_hash, n_leaves, data.len());
         bad.insert(0);
     }
+    let bs = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let len = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let len_bad = len != 0 && len.div_ceil(BLOCK_SIZE!() as u64) != n_leaves as u64;
+    if bs != 0 && bs != BLOCK_SIZE!() || len_bad {
+        warn!("check_tree_v2_data: header block size {} or length {} does not fit n_leaves={}", bs, len, n_leaves);
+        bad.insert(0);
+    }
     if n_leaves < 2 {
         return bad.into_iter().collect();
     }
@@ -1487,6 +1501,32 @@ fn check_tree_v2_data(data: &[u8], expected_hash: &str, n_leaves: usize) -> Vec<
         }
     }
     bad.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tree_v2_header_field_tests {
+    use super::*;
+
+    #[test]
+    fn header_fields_are_written_and_checked() {
+        let data = vec![7u8; 3 * 4096 + 5];
+        let mut t = MmapMut::map_anon(tree_file_size_v2(4)).unwrap();
+        let base = t.len() - 4 * 32;
+        for (i, c) in data.chunks(BLOCK_SIZE!()).enumerate() {
+            let cv = block_chaining_value(c, (i * BLOCK_SIZE!()) as u64);
+            t[base + i * 32..base + (i + 1) * 32].copy_from_slice(&cv);
+        }
+        let root = finalize_tree_mmap_v2(&mut t, 4).unwrap().to_hex();
+        assert!(check_tree_v2_data(&t, &root, 4).is_empty());
+        write_tree_v2_header_fields(&mut t, data.len() as u64);
+        assert_eq!(&t[4..16], &[0, 16, 0, 0, 5, 48, 0, 0, 0, 0, 0, 0]);
+        assert!(check_tree_v2_data(&t, &root, 4).is_empty());
+        write_tree_v2_header_fields(&mut t, 5 * 4096);
+        assert!(!check_tree_v2_data(&t, &root, 4).is_empty());
+        write_tree_v2_header_fields(&mut t, data.len() as u64);
+        t[4..8].copy_from_slice(&8192u32.to_le_bytes());
+        assert!(!check_tree_v2_data(&t, &root, 4).is_empty());
+    }
 }
 
 // Build the tree file from a source mmap in one pass.
@@ -1526,6 +1566,7 @@ fn build_tree_from_mmap(
     } else {
         format!("{}", finalize_tree_mmap_v2(&mut tmm, n_leaves).unwrap())
     };
+    write_tree_v2_header_fields(&mut tmm, file_size as u64);
     drop(tmm);
     drop(tf);
     let tree_path = format!("./cjp2p/public/blake3_tree_v2/{}", blake3_id);
@@ -1716,6 +1757,7 @@ fn handle_upload(mut stream: TcpStream, req: HttpRequest) {
         } else {
             format!("{}", finalize_tree_mmap_v2(&mut tree_mmap, leaf_count).unwrap())
         };
+        write_tree_v2_header_fields(&mut tree_mmap, block_offset);
         drop(tree_mmap);
         drop(tf);
         let blake3_dest = format!("./cjp2p/public/blake3/{}", blake3);
