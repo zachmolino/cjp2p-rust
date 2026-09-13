@@ -4733,6 +4733,7 @@ struct ContentGateway {
     sent_header: bool,
     eof: Option<usize>,
     pending_latest: Option<LatestData>,
+    is_head: bool,
     initiator: Initiator,
 }
 enum Initiator {
@@ -4765,6 +4766,7 @@ impl ContentGateway {
             sent_header: false,
             eof: None,
             pending_latest,
+            is_head: req.method == "HEAD",
             initiator,
         }
     }
@@ -4925,6 +4927,11 @@ impl ContentGateway {
                 }
             }
             self.sent_header = true;
+            if self.is_head {
+                self.http_done = true;
+                self.waiting_for_browser = false;
+                return;
+            }
         }
 
         debug!("cg {} serve_mmap {}-{} [available {} ] of {}",self.http_socket.as_raw_fd(),self.http_start,http_end,available_end,self.eof.unwrap_or(0x7fffffffff));
