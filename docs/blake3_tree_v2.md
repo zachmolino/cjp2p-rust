@@ -4,6 +4,12 @@ This describes the `blake3_tree_v2` tree file the node builds, and the checks a
 reader needs to trust one. It was written from `src/main.rs` (functions named
 below) so the format has a description outside the code.
 
+It describes the node as of the commits that land with it, not the `master`
+before them. On that `master`, one-block trees fail to load, the tree check does
+not compare the root with the top level or copied-up entries with their copies,
+and reserved header bytes are stored and served as received. The choices behind
+those changes are in `docs/adr/0002-blake3-tree-v2-integrity.md`.
+
 ## Two ids, one digest
 
 - `blake3/<root>` names content.
