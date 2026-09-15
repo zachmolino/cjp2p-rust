@@ -268,6 +268,7 @@ struct PeerState {
     list_results: HashMap<String, (i32, u64)>,
     list_time: Instant,
     p: PersistentState,
+    socket_is_ipv6: bool,
     next_maintenance: Instant,
     next_save: Instant,
     last_upnp: std::time::SystemTime,
@@ -388,6 +389,7 @@ impl PeerState {
             list_results: HashMap::new(),
             list_time: Instant::now(),
             p: PersistentState::load(),
+            socket_is_ipv6: false,
             next_maintenance: Instant::now() - Duration::from_secs(99999),
             next_save: Instant::now() + Duration::from_secs(150),
             last_upnp: std::time::SystemTime::now(),
@@ -417,6 +419,7 @@ impl PeerState {
             }
         }
 
+        ps.socket_is_ipv6 = ps.socket.local_addr().map_or(false, |a| a.is_ipv6());
         ps.socket.set_broadcast(true).ok();
         ps.socket.set_nonblocking(true).unwrap();
         SockRef::from(&ps.socket)
@@ -452,6 +455,19 @@ impl PeerState {
         ps.upnp_ipv6();
         return ps;
     }
+    // The socket is IPv6 whenever that bind worked, and sending to an IPv4 address on an
+    // IPv6 socket fails with EINVAL, so an IPv4 peer is addressed in its v4-mapped form.
+    // Peers stay in their IPv4 form everywhere else: that is how they arrive back, since
+    // received v4-mapped sources are unmapped in handle_message.
+    fn send_to(&self, bytes: &[u8], sa: SocketAddr) -> std::io::Result<usize> {
+        match (self.socket_is_ipv6, sa) {
+            (true, SocketAddr::V4(v4)) => self
+                .socket
+                .send_to(bytes, SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port())),
+            _ => self.socket.send_to(bytes, sa),
+        }
+    }
+
     fn active_peers_from_pub_map(&self) -> Vec<(SocketAddr, Ed25519Pub, Duration)> {
         self.peer_map_by_pub
             .iter()
@@ -539,7 +555,7 @@ impl PeerState {
             message_out.append(&mut self.always_returned(*sa));
             let message_out_bytes: Vec<u8> = serde_json::to_vec(&message_out).unwrap();
             trace!( "sending message {:?} to {sa}", String::from_utf8_lossy(&message_out_bytes));
-            self.socket.send_to(&message_out_bytes, sa).ok();
+            self.send_to(&message_out_bytes, *sa).ok();
             log_if_slow(nowi, line!().to_string());
         }
     }
@@ -663,7 +679,7 @@ impl PeerState {
             let message_out_bytes: Vec<u8> = serde_json::to_vec(&message_out).unwrap();
             trace!( "PROBE probing {sa}");
             //            trace!( "PROBE sending message {:?} to {sa}", String::from_utf8_lossy(&message_out_bytes));
-            match self.socket.send_to(&message_out_bytes, sa) {
+            match self.send_to(&message_out_bytes, sa) {
                 Ok(s) => trace!("sent {s}"),
                 Err(e) => {
                     if e.raw_os_error() == Some(11) {
@@ -2429,7 +2445,7 @@ fn handle_line(
                         6881,
                     ))
                 };
-                ps.socket.send_to(&[], s).ok();
+                ps.send_to(&[], s).ok();
                 if ((c << 8) + d) % (rate / 500) == 0 {
                     std::thread::sleep(Duration::from_millis(2));
                     let sent = (c << 8) + d;
@@ -2469,7 +2485,7 @@ fn handle_line(
                 }
                 let message_out_bytes: Vec<u8> = serde_json::to_vec(&message_out).unwrap();
                 trace!( "sending message {:?} to {addr}", String::from_utf8_lossy(&message_out_bytes));
-                ps.socket.send_to(&message_out_bytes, addr).ok();
+                ps.send_to(&message_out_bytes, dst).ok();
             }
         }
     } else if line == "/peers" {
@@ -2574,7 +2590,7 @@ fn handle_line(
             }
             let message_out_bytes: Vec<u8> = serde_json::to_vec(&message_out).unwrap();
             trace!( "sending message {:?} to {sa}", String::from_utf8_lossy(&message_out_bytes));
-            ps.socket.send_to(&message_out_bytes, sa).ok();
+            ps.send_to(&message_out_bytes, *sa).ok();
         }
     } else if line == "/update" {
         let exe = env::current_exe().unwrap();
@@ -2758,7 +2774,7 @@ fn handle_line(
             // no point in encrypting spam
             let message_out_bytes: Vec<u8> = serde_json::to_vec(&message_out).unwrap();
             trace!( "sending message {:?} to {sa}", String::from_utf8_lossy(&message_out_bytes));
-            ps.socket.send_to(&message_out_bytes, sa).ok();
+            ps.send_to(&message_out_bytes, sa).ok();
         }
     } else {
         let mut group_name = ps.last_group.clone();
@@ -3658,7 +3674,7 @@ fn handle_network(
         )
         .unwrap();
     } */
-    match ps.socket.send_to(&message_out_bytes, src) {
+    match ps.send_to(&message_out_bytes, src) {
         Ok(s) => trace!("sent {s}"),
         Err(e) => {
             if e.raw_os_error() == Some(11) {
@@ -4541,7 +4557,7 @@ impl StreamState {
             let message_out_bytes: Vec<u8> = serde_json::to_vec(&message_out).unwrap();
             debug!( "requesting additional blocks {:?} to {sa}", String::from_utf8_lossy(&message_out_bytes)
             );
-            ps.socket.send_to(&message_out_bytes, sa).ok();
+            ps.send_to(&message_out_bytes, sa).ok();
         }
     }
 }
@@ -4937,7 +4953,7 @@ impl InboundState {
             let message_out_bytes: Vec<u8> = serde_json::to_vec(&message_out).unwrap();
             debug!( "requesting additional blocks {:?} to {sa}", String::from_utf8_lossy(&message_out_bytes)
             );
-            ps.socket.send_to(&message_out_bytes, sa).ok();
+            ps.send_to(&message_out_bytes, sa).ok();
         }
     }
 
@@ -5554,7 +5570,7 @@ impl Receive for Forward {
                 messages.push(serde_json::to_value(&c[0]).unwrap());
             }
             let message_out_bytes = serde_json::to_vec(&messages).unwrap();
-            ps.socket.send_to(&message_out_bytes, to).ok();
+            ps.send_to(&message_out_bytes, to).ok();
             return vec![];
         }
         if let Some(to) = self.to_ed25519 {
@@ -6747,7 +6763,7 @@ fn msgs_to_pub(ps: &mut PeerState, to: Ed25519Pub, messages: &Vec<Value>) -> () 
             message_out.pop();
         }
         trace!( "sending message {:?} to {sa} {to}", String::from_utf8_lossy(&message_out_bytes));
-        ps.socket.send_to(&message_out_bytes, sa).ok();
+        ps.send_to(&message_out_bytes, *sa).ok();
         return;
     }
     ps.socket.set_nonblocking(false).unwrap();
@@ -6758,7 +6774,7 @@ fn msgs_to_pub(ps: &mut PeerState, to: Ed25519Pub, messages: &Vec<Value>) -> () 
         let mut message_out = vec![Message::WhereAreThey(WhereAreThey{ed25519h:to})];
         message_out.append(&mut ps.always_returned(sa));
         let message_out_bytes: Vec<u8> = serde_json::to_vec(&message_out).unwrap();
-        ps.socket.send_to(&message_out_bytes, sa).ok();
+        ps.send_to(&message_out_bytes, sa).ok();
     }
     ps.socket.set_nonblocking(true).unwrap();
 }
