@@ -361,6 +361,7 @@ impl PeerState {
             },
             socket: (|| -> std::io::Result<UdpSocket> {
                 let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 unsafe {
                     let val: libc::c_int = 0x0002; // IPV6_PREFER_SRC_PUBLIC
                     libc::setsockopt(
@@ -1278,9 +1279,14 @@ fn parse_header(stream: &mut TcpStream) -> Option<HttpRequest> {
 }
 
 fn free_disk_bytes() -> u64 {
+    // macOS has no statvfs64; its statvfs already has 64-bit fields.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use libc::statvfs64 as statvfs;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    use libc::statvfs;
     unsafe {
-        let mut stat: libc::statvfs64 = std::mem::zeroed();
-        if libc::statvfs64(b".\0".as_ptr() as *const libc::c_char, &mut stat) == 0 {
+        let mut stat: statvfs = std::mem::zeroed();
+        if statvfs(b".\0".as_ptr() as *const libc::c_char, &mut stat) == 0 {
             (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
         } else {
             0
@@ -1844,6 +1850,7 @@ fn get_local_ip_for_gateway(gateway_ip: Ipv4Addr) -> Ipv4Addr {
 
 // Find the IPv6 default gateway and its interface index via netlink RTM_GETROUTE.
 // This uses the kernel's routing socket API, which works on Linux and Android alike.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn pcp_find_ipv6_gateway() -> Option<(Ipv6Addr, u32)> {
     use nix::sys::socket::{
         bind, recvfrom, sendto, socket, AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockType,
@@ -1945,6 +1952,12 @@ fn pcp_find_ipv6_gateway() -> Option<(Ipv6Addr, u32)> {
     }
 
     best_gw.map(|gw| (gw, best_oif))
+}
+
+// No netlink off Linux, so PCP skips IPv6 gateway discovery.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn pcp_find_ipv6_gateway() -> Option<(Ipv6Addr, u32)> {
+    None
 }
 
 // SSDP M-SEARCH for WANIPv6FirewallControl, then parse the device description to get the
