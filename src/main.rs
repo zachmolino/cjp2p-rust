@@ -1334,6 +1334,18 @@ fn tree_file_size_v2(n_leaves: usize) -> usize {
     60 + tree_file_size(n_leaves)
 }
 
+// A blake3_tree_v2 id names a tree file's magic, root and levels. Header bytes 4..32 are
+// reserved: written zero, never read, never a reason to reject a tree. The id cannot cover
+// them, so they are zeroed wherever tree bytes are stored or sent, whatever a peer sent or
+// an older node stored. `data` is the part of a tree file that starts at byte `offset`.
+fn zero_tree_v2_reserved_bytes(data: &mut [u8], offset: usize) {
+    let start = offset.max(4);
+    let end = offset.saturating_add(data.len()).min(32);
+    if start < end {
+        data[start - offset..end - offset].fill(0);
+    }
+}
+
 // Fills in the 64-byte v2 header and all intermediate levels of a tree mmap whose leaf
 // section (last n_leaves*32 bytes) has already been written by the caller.
 // Writes magic, reserved zeroes, and (for n_leaves>=2) the computed root hash.
@@ -1557,6 +1569,36 @@ mod tree_v2_tests {
             assert_eq!(block_matches_tree_v2(&tree, &root, 0, &data), Some(true));
             assert_eq!(block_matches_tree_v2(&tree, &root, 0, &data[1..]), Some(false));
             assert_eq!(block_matches_tree_v2(&tree, &root, 1, &data), None);
+        }
+    }
+
+    #[test]
+    fn reserved_bytes_are_accepted_then_zeroed() {
+        let content: Vec<u8> = (0..3 * BLOCK_SIZE!() + 100)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (tree, n_leaves) = tree_v2_for(&content);
+        let root = blake3::hash(&content).to_hex();
+        let built = tree.to_vec();
+        assert!(built[4..32].iter().all(|&b| b == 0));
+
+        // same magic, root and levels as built, with arbitrary bytes in the reserved range
+        let mut doctored = built.clone();
+        doctored[4..32].fill(0xa5);
+        assert_eq!(n_leaves_from_tree_v2_eof(doctored.len()), Some(n_leaves));
+        assert!(check_tree_v2_data(&doctored, &root, n_leaves).is_empty());
+
+        // stored: the whole file, zeroed back to what this node would have built
+        let mut stored = doctored.clone();
+        zero_tree_v2_reserved_bytes(&mut stored, 0);
+        assert_eq!(stored, built);
+
+        // pieces sent to peers: only the overlap with 4..32 is zeroed, whatever the offset
+        for (offset, len) in [(0, 4096), (0, 32), (0, 10), (2, 4), (10, 4), (20, 100), (31, 1), (32, 64)] {
+            let end = (offset + len).min(doctored.len());
+            let mut piece = doctored[offset..end].to_vec();
+            zero_tree_v2_reserved_bytes(&mut piece, offset);
+            assert_eq!(piece, built[offset..end], "offset={offset} len={len}");
         }
     }
 }
@@ -4179,6 +4221,9 @@ impl Content {
         let mut buf = vec![0; length];
         let length = ofr.file.read_at(&mut buf, req.offset as u64).unwrap();
         buf.truncate(length);
+        if req.id.starts_with("blake3_tree_v2/") {
+            zero_tree_v2_reserved_bytes(&mut buf, req.offset);
+        }
         if req.id.starts_with("blake3_tree_v2/")
             && req.offset == 0
             && buf.len() >= 4
@@ -4379,6 +4424,12 @@ impl Receive for Content {
                     }
                 };
                 if bad.is_empty() {
+                    if let Some(data) = inbound_states
+                        .get_mut(&self.id)
+                        .and_then(|ti| ti.mmap.as_deref_mut())
+                    {
+                        zero_tree_v2_reserved_bytes(data, 0);
+                    }
                     let incoming = format!("./cjp2p/incoming/{}", self.id);
                     let public = format!("./cjp2p/public/{}", self.id);
                     if fs::rename(&incoming, &public).is_ok() {
