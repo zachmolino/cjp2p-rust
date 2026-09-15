@@ -824,6 +824,15 @@ impl PeerState {
             }
             return;
         }
+
+        if cg.only_if_cached {
+            // An in-progress download is not "cached": its blocks are unverified.
+            cg.http_socket
+                .write_all(b"HTTP/1.0 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
+                .ok();
+            self.content_gateways.remove(cg_index);
+            return;
+        }
         let id = cg.id.clone();
 
         if let Some(ss) = stream_states.get_mut(&id) {
@@ -1275,6 +1284,17 @@ fn parse_header(stream: &mut TcpStream) -> Option<HttpRequest> {
         headers,
         body_prefix,
     })
+}
+
+// RFC 9111 5.2.1.7
+fn has_only_if_cached(headers: &HashMap<String, String>) -> bool {
+    headers
+        .get("cache-control")
+        .map(|v| {
+            v.split(',')
+                .any(|d| d.trim().eq_ignore_ascii_case("only-if-cached"))
+        })
+        .unwrap_or(false)
 }
 
 // The first byte and the exclusive end a Range header value asks for. The end is None
@@ -4554,6 +4574,7 @@ struct ContentGateway {
     pending_latest: Option<LatestData>,
     is_head: bool,
     initiator: Initiator,
+    only_if_cached: bool,
 }
 enum Initiator {
     Latest,
@@ -4586,6 +4607,9 @@ impl ContentGateway {
             eof: None,
             pending_latest,
             is_head: req.method == "HEAD",
+            // ByHash only: Latest/Stream ask peers before a ContentGateway exists.
+            only_if_cached: matches!(initiator, Initiator::ByHash)
+                && has_only_if_cached(&req.headers),
             initiator,
         }
     }
