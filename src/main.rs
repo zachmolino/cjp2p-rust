@@ -1489,6 +1489,15 @@ fn check_tree_v2_data(data: &[u8], expected_hash: &str, n_leaves: usize) -> Vec<
     bad.into_iter().collect()
 }
 
+// A tree file is identified by its magic, root and levels. The 28 reserved header bytes
+// (4..32) are not covered by the blake3_tree_v2 id, so a tree is not rejected for having
+// something there, but it is stored and served with them zeroed: one id, one file.
+fn canonicalize_tree_v2_header(data: &mut [u8]) {
+    if data.len() >= 64 {
+        data[4..32].fill(0);
+    }
+}
+
 // Build the tree file from a source mmap in one pass.
 // If sha256 is Some, updates it with every chunk in the same pass.
 // Returns the blake3 hex ID, or None on I/O error.
@@ -4307,6 +4316,12 @@ impl Receive for Content {
                     }
                 };
                 if bad.is_empty() {
+                    if let Some(data) = inbound_states
+                        .get_mut(&self.id)
+                        .and_then(|ti| ti.mmap.as_deref_mut())
+                    {
+                        canonicalize_tree_v2_header(data);
+                    }
                     let incoming = format!("./cjp2p/incoming/{}", self.id);
                     let public = format!("./cjp2p/public/{}", self.id);
                     if fs::rename(&incoming, &public).is_ok() {
@@ -6850,5 +6865,39 @@ fn tcpstream_is_closed(stream: &TcpStream) -> bool {
         Ok(_) => false,
         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
         Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_v2_reserved_header_bytes_accepted_then_zeroed() {
+        let content: Vec<u8> = (0..3 * BLOCK_SIZE!() + 100)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let n_leaves = (content.len() + BLOCK_SIZE!() - 1) / BLOCK_SIZE!();
+        let mut tree = MmapMut::map_anon(tree_file_size_v2(n_leaves)).unwrap();
+        let leaf_base = tree.len() - n_leaves * 32;
+        for (i, block) in content.chunks(BLOCK_SIZE!()).enumerate() {
+            let cv = block_chaining_value(block, (i * BLOCK_SIZE!()) as u64);
+            tree[leaf_base + i * 32..leaf_base + (i + 1) * 32].copy_from_slice(&cv);
+        }
+        let root = finalize_tree_mmap_v2(&mut tree, n_leaves).unwrap();
+        let hash = format!("{}", root);
+        let built = tree.to_vec();
+        assert!(built[4..32].iter().all(|&b| b == 0));
+
+        // same magic, root and levels as built, with something in the reserved bytes
+        let mut received = built.clone();
+        received[4..8].copy_from_slice(&(BLOCK_SIZE!() as u32).to_le_bytes());
+        received[8..16].copy_from_slice(&(content.len() as u64).to_le_bytes());
+        received[16..32].fill(0xa5);
+        assert_eq!(n_leaves_from_tree_v2_eof(received.len()), Some(n_leaves));
+        assert!(check_tree_v2_data(&received, &hash, n_leaves).is_empty());
+
+        canonicalize_tree_v2_header(&mut received);
+        assert_eq!(received, built);
     }
 }
