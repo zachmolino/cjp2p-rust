@@ -4683,12 +4683,30 @@ enum Initiator {
     ByHash,
 }
 impl ContentGateway {
+    // RFC 9110 15.5.17: once http_end is resolved and clamped to eof, a satisfiable
+    // range has http_start < http_end. Anything else (a start at or past eof, or
+    // start > end) would underflow http_end - http_start in serve_mmap, so answer 416.
+    fn refused_unsatisfiable_range(&mut self) -> bool {
+        let end = self.http_end.expect("http_end resolved before the range check");
+        if !self.ranged || self.http_start < end {
+            return false;
+        }
+        let response = format!("HTTP/1.0 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\n\r\n", self.eof.unwrap());
+        self.http_socket.write_all(response.as_bytes()).ok();
+        self.http_done = true;
+        self.waiting_for_browser = false;
+        true
+    }
+
     fn serve_content_from_disk(&mut self, file: &File) {
         if self.eof.is_none() {
             self.eof = Some(file.metadata().unwrap().len() as usize);
         }
         // No end given, or a given end past eof: clamp to eof.
         self.http_end = Some(self.http_end.map_or(self.eof.unwrap(), |e| e.min(self.eof.unwrap())));
+        if self.refused_unsatisfiable_range() {
+            return;
+        }
         // i couldnt figure out how to get serve_mmap to take both Mmap or MmapMut.
         let mmap = unsafe { MmapMut::map_mut(file).unwrap() };
         self.serve_mmap(&mmap, self.http_end.unwrap());
@@ -4702,6 +4720,9 @@ impl ContentGateway {
         self.eof = Some(i.eof);
         // No end given, or a given end past eof: clamp to eof.
         self.http_end = Some(self.http_end.map_or(i.eof, |e| e.min(i.eof)));
+        if self.refused_unsatisfiable_range() {
+            return;
+        }
 
         let mut available_end = self.http_end.unwrap();
         if let Some(not_available) = ((self.http_start / BLOCK_SIZE!())
