@@ -4578,12 +4578,29 @@ impl ContentGateway {
         self.waiting_for_browser = false;
     }
 
+    // Clamps http_end to eof, after which a satisfiable range has http_start < http_end.
+    // Anything else (a start at or past eof, or start > end) would underflow
+    // http_end - http_start, so it gets 416 (RFC 9110 15.5.17) and false.
+    fn clamp_range_or_answer_416(&mut self) -> bool {
+        let eof = self.eof.unwrap();
+        if self.http_end == 0 || eof < self.http_end {
+            self.http_end = eof;
+        }
+        if !self.ranged || self.http_start < self.http_end {
+            return true;
+        }
+        let response = format!("HTTP/1.0 416 Range Not Satisfiable\r\nContent-Range: bytes */{eof}\r\nContent-Length: 0\r\n\r\n");
+        self.http_socket.write_all(response.as_bytes()).ok();
+        self.finish_response();
+        false
+    }
+
     fn serve_content_from_disk(&mut self, file: &File) {
         if self.eof.is_none() {
             self.eof = Some(file.metadata().unwrap().len() as usize);
         }
-        if self.http_end == 0 || self.eof.unwrap() < self.http_end {
-            self.http_end = self.eof.unwrap();
+        if !self.clamp_range_or_answer_416() {
+            return;
         }
         // i couldnt figure out how to get serve_mmap to take both Mmap or MmapMut.
         let mmap = unsafe { MmapMut::map_mut(file).unwrap() };
@@ -4596,8 +4613,8 @@ impl ContentGateway {
             return;
         }
         self.eof = Some(i.eof);
-        if self.http_end == 0 || self.eof.unwrap() < self.http_end {
-            self.http_end = self.eof.unwrap();
+        if !self.clamp_range_or_answer_416() {
+            return;
         }
 
         let mut available_end = self.http_end;
