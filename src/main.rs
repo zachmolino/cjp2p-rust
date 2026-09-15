@@ -4573,6 +4573,11 @@ enum Initiator {
     ByHash,
 }
 impl ContentGateway {
+    fn finish_response(&mut self) {
+        self.http_done = true;
+        self.waiting_for_browser = false;
+    }
+
     fn serve_content_from_disk(&mut self, file: &File) {
         if self.eof.is_none() {
             self.eof = Some(file.metadata().unwrap().len() as usize);
@@ -4677,8 +4682,7 @@ impl ContentGateway {
                 Ok(_) => (),
                 Err(e) => {
                     warn!("cg {} http failed to write header {}",self.http_socket.as_raw_fd(),e);
-                    self.http_done = true; // give up, that shouldnt happen
-                    self.waiting_for_browser = false;
+                    self.finish_response(); // give up, that shouldnt happen
                 }
             }
             self.sent_header = true;
@@ -4696,8 +4700,7 @@ impl ContentGateway {
                     // failed to send (your wifi/mobile connection is probably backing up) {0} {e}", msg_out.len());
                 } else {
                     warn!("cg {} http client error {e}",self.http_socket.as_raw_fd());
-                    self.http_done = true;
-                    self.waiting_for_browser = false;
+                    self.finish_response();
                     return;
                 }
             }
