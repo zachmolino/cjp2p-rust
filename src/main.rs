@@ -272,6 +272,7 @@ struct PeerState {
     next_save: Instant,
     last_upnp: std::time::SystemTime,
     port_mapping_disabled: bool,
+    bootstrap_disabled: bool,
     recorded_chats: HashMap<String, Vec<String>>,
     all_chats: Vec<(String, String)>,
     displayed_group_chat_ids: HashSet<(String, i64)>,
@@ -393,6 +394,7 @@ impl PeerState {
             next_save: Instant::now() + Duration::from_secs(150),
             last_upnp: std::time::SystemTime::now(),
             port_mapping_disabled: Path::new(".no_port_mapping").exists(),
+            bootstrap_disabled: Path::new(".no_bootstrap").exists(),
             recorded_chats: HashMap::new(),
             all_chats: Vec::new(),
             displayed_group_chat_ids: HashSet::new(),
@@ -436,7 +438,7 @@ impl PeerState {
         debug!("{} is loopback? {} ", ipv6, ipv6.is_loopback());
         debug!("{} is loopback? {} ", v4_in_v6, v4_in_v6.is_loopback()); //false, strange
         debug!("{} is loopback? {} ", v4_in_v6, v4_in_v6.to_ipv4().unwrap().is_loopback());
-        if !Path::new(".no_bootstrap").exists() {
+        if !ps.bootstrap_disabled {
             for bootstrap in [
                 "148.71.89.128:24254",
                 "159.69.54.127:24254",
@@ -5202,7 +5204,11 @@ fn maintenance(
         ps.p.save();
     }
     log_if_slow(nowi, line!().to_string());
-    ps.probe_interfaces();
+    // .no_bootstrap also means no local discovery: probe_interfaces shouts to the subnet
+    // broadcast address, 224.0.0.1 and ff02::1, which a private node has no business doing.
+    if !ps.bootstrap_disabled {
+        ps.probe_interfaces();
+    }
     log_if_slow(nowi, line!().to_string());
     ps.probe();
     log_if_slow(nowi, line!().to_string());
