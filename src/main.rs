@@ -3565,7 +3565,7 @@ fn handle_network(
 
     let src = match src {
         SocketAddr::V4(_) => src,
-        SocketAddr::V6(v6) => match v6.ip().to_ipv4() {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
             Some(ip) => SocketAddr::new(std::net::IpAddr::V4(ip), src.port()),
             _ => src,
         },
