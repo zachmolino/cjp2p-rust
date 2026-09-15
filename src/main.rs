@@ -1111,16 +1111,7 @@ impl PeerState {
             };
             debug!("UPnP IPv6: control URL {control_url}");
 
-            let local_ipv6 = match pcp_find_ipv6_gateway().and_then(|(gw, oif)| {
-                let scope_id = if gw.is_unicast_link_local() { oif } else { 0 };
-                let gw_sock = SocketAddr::V6(std::net::SocketAddrV6::new(gw, 5351, 0, scope_id));
-                let s = UdpSocket::bind("[::]:0").ok()?;
-                s.connect(gw_sock).ok()?;
-                match s.local_addr().ok()?.ip() {
-                    IpAddr::V6(v6) => Some(v6),
-                    _ => None,
-                }
-            }) {
+            let local_ipv6 = match local_ipv6_source() {
                 Some(ip) => ip,
                 None => {
                     warn!("UPnP IPv6: could not determine local IPv6 address");
@@ -1958,6 +1949,18 @@ fn pcp_find_ipv6_gateway() -> Option<(Ipv6Addr, u32)> {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn pcp_find_ipv6_gateway() -> Option<(Ipv6Addr, u32)> {
     None
+}
+
+// The local IPv6 address the kernel would use to reach the wider network. Connecting a UDP
+// socket picks the source address for that route without sending anything, which needs no
+// netlink, so this works the same off Linux.
+fn local_ipv6_source() -> Option<Ipv6Addr> {
+    let s = UdpSocket::bind("[::]:0").ok()?;
+    s.connect("[2001:4860:4860::8888]:53").ok()?;
+    match s.local_addr().ok()?.ip() {
+        IpAddr::V6(v6) => Some(v6),
+        _ => None,
+    }
 }
 
 // SSDP M-SEARCH for WANIPv6FirewallControl, then parse the device description to get the
