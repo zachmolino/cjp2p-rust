@@ -4780,11 +4780,36 @@ impl ContentGateway {
         http_end
     }
 
+    // RFC 9110 15.5.17: once http_end is resolved and clamped to eof, a satisfiable
+    // range has http_start < http_end. Anything else (a start at or past eof, or
+    // start > end) would underflow http_end - http_start in serve_mmap, so answer 416.
+    // A live stream has no eof yet, so its 416 carries no Content-Range.
+    fn refused_unsatisfiable_range(&mut self, http_end: usize) -> bool {
+        if !self.ranged || self.http_start < http_end {
+            return false;
+        }
+        let content_range = match self.eof {
+            Some(eof) => format!("Content-Range: bytes */{}\r\n", eof),
+            None => String::new(),
+        };
+        let response = format!(
+            "HTTP/1.0 416 Range Not Satisfiable\r\nContent-Length: 0\r\n{}\r\n",
+            content_range
+        );
+        self.http_socket.write_all(response.as_bytes()).ok();
+        self.http_done = true;
+        self.waiting_for_browser = false;
+        true
+    }
+
     fn serve_content_from_disk(&mut self, file: &File) {
         if self.eof.is_none() {
             self.eof = Some(file.metadata().unwrap().len() as usize);
         }
         let http_end = self.clamp_end_to_eof(self.eof.unwrap());
+        if self.refused_unsatisfiable_range(http_end) {
+            return;
+        }
         // i couldnt figure out how to get serve_mmap to take both Mmap or MmapMut.
         let mmap = unsafe { MmapMut::map_mut(file).unwrap() };
         self.serve_mmap(&mmap, http_end);
@@ -4797,6 +4822,9 @@ impl ContentGateway {
         }
         self.eof = Some(i.eof);
         let http_end = self.clamp_end_to_eof(i.eof);
+        if self.refused_unsatisfiable_range(http_end) {
+            return;
+        }
 
         let mut available_end = http_end;
         if let Some(not_available) = ((self.http_start / BLOCK_SIZE!())
@@ -4824,6 +4852,9 @@ impl ContentGateway {
         // A live stream has no fixed eof to clamp an unspecified end to yet;
         // available_end (from what's downloaded so far) bounds it instead.
         let http_end = *self.http_end.get_or_insert(0x7fffffffff);
+        if self.refused_unsatisfiable_range(http_end) {
+            return;
+        }
         let start_block = self.http_start / BLOCK_SIZE!();
         let mut available_end = match ss.first_zero_from(start_block) {
             Some(zero_block) => zero_block * BLOCK_SIZE!(),
