@@ -3351,6 +3351,14 @@ fn handle_web_request(
                     stream.write_all(b"HTTP/1.0 403 Forbidden\r\n\n").ok();
                     return;
                 }
+                // only-if-cached: no GetLatest goes out, so the mapping has to be cached too
+                let only_if_cached = has_only_if_cached(&req.headers);
+                if only_if_cached && sha256_opt.is_none() {
+                    stream
+                        .write_all(b"HTTP/1.0 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
+                        .ok();
+                    return;
+                }
                 let pending_latest = if sha256_opt.is_none() {
                     Some(LatestData {
                         pub_key: ed25519,
@@ -3363,10 +3371,14 @@ fn handle_web_request(
                         pub_key: ed25519,
                         name: name.clone(),
                         highest_version: load_seq_from_latest_cache(&cache_path) as i64,
-                        delay_for_newest_until: Some(Instant::now() + Duration::from_millis(300)),
+                        delay_for_newest_until: if only_if_cached {
+                            None
+                        } else {
+                            Some(Instant::now() + Duration::from_millis(300))
+                        },
                     })
                 };
-                if ed25519 != ps.keypair.public {
+                if ed25519 != ps.keypair.public && !only_if_cached {
                     let mut peers = ps.best_peers(250, 6);
                     if let Some(Source::S(sa)) = ps.peer_map_by_pub.get(&ed25519) {
                         let mut msg_out = vec![Message::GetLatest(gl.clone())];
@@ -3400,7 +3412,7 @@ fn handle_web_request(
                     eof: None,
                     pending_latest,
                     initiator: Initiator::Latest,
-                    only_if_cached: false,
+                    only_if_cached,
                 });
                 if ps.content_gateways[index].pending_latest.is_none() {
                     ps.serve_http_content(stream_states, inbound_states, index);
@@ -4589,7 +4601,7 @@ struct ContentGateway {
     eof: Option<usize>,
     pending_latest: Option<LatestData>,
     initiator: Initiator,
-    // ByHash only: Latest/Stream ask peers before a ContentGateway exists.
+    // Not set for Stream, which serves a live stream from a peer, never a cached one.
     only_if_cached: bool,
 }
 enum Initiator {
