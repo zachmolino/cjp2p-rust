@@ -1288,56 +1288,166 @@ fn free_disk_bytes() -> u64 {
     }
 }
 
-// Compute the blake3 chaining value for a block at the given byte offset.
-// BLOCK_SIZE must be a power-of-2 multiple of blake3::CHUNK_LEN (1024), which 4096 is.
-fn block_chaining_value(data: &[u8], byte_offset: u64) -> [u8; 32] {
-    let mut h = Blake3Hasher::new();
-    h.set_input_offset(byte_offset);
-    h.update(data);
-    h.finalize_non_root()
-}
+// The block every transfer uses. For blake3 content each block is also a whole BLAKE3
+// subtree, which it can only be as a power-of-two count of BLAKE3's 1024-byte chunks.
+const BLOCK_SIZE: usize = BLOCK_SIZE!();
+const _: () = assert!(
+    BLOCK_SIZE % blake3::CHUNK_LEN == 0 && (BLOCK_SIZE / blake3::CHUNK_LEN).is_power_of_two()
+);
+const TREE_MAGIC: [u8; 4] = *b"B3T\x02";
+const TREE_HEADER_LEN: usize = 64;
+const CV_LEN: usize = 32;
 
-fn leaf_cv_in_tree_v2(mmap: &Mmap, block_num: usize) -> Option<[u8; 32]> {
-    let n_leaves = n_leaves_from_tree_v2_eof(mmap.len())?;
-    if block_num >= n_leaves {
-        return None;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockIndex(usize);
+
+#[derive(Clone, Copy, Debug)]
+struct ContentLen(usize);
+
+impl ContentLen {
+    // 0 for empty content, which has no tree
+    fn blocks(self) -> usize {
+        self.0.div_ceil(BLOCK_SIZE)
     }
-    let leaf_start = mmap.len() - n_leaves * 32 + block_num * 32;
-    Some(mmap[leaf_start..leaf_start + 32].try_into().unwrap())
 }
 
-// A one-block tree's leaf is not bound to its root (that root is blake3::hash of the
-// content), so its block is checked against the root instead. None: no such block.
-fn block_matches_tree_v2(tree: &Mmap, root: &str, i: usize, data: &[u8]) -> Option<bool> {
-    if tree.len() == tree_file_size_v2(1) {
-        return (i == 0).then(|| blake3::hash(data).to_hex().as_str() == root);
+// BLOCK_SIZE bytes, except the content's last block, which is 1..=BLOCK_SIZE
+struct Block<'a> {
+    index: BlockIndex,
+    bytes: &'a [u8],
+}
+
+impl<'a> Block<'a> {
+    fn all(content: &'a [u8]) -> impl Iterator<Item = Block<'a>> {
+        content
+            .chunks(BLOCK_SIZE)
+            .enumerate()
+            .map(|(i, bytes)| Block { index: BlockIndex(i), bytes })
     }
-    Some(block_chaining_value(data, (i * BLOCK_SIZE!()) as u64) == leaf_cv_in_tree_v2(tree, i)?)
 }
 
-// Tree file v2 format (64-byte header, then top-down levels, leaves last):
-//   [4 bytes: magic b"B3T\x02"] [28 bytes: reserved] [32 bytes: root hash]
-//   [intermediate levels highest-first, each level including passed-up odd entries]
-//   [N x 32 bytes: leaf CVs at the end]
-// N (leaf count) is not stored; derive it from content file size or eof.
-fn tree_file_size(n_leaves: usize) -> usize {
-    let mut total = 4 + n_leaves * 32;
-    let mut n = n_leaves;
-    while n > 2 {
-        n = (n + 1) / 2;
-        total += n * 32;
+// A BLAKE3 subtree hash that is not the root: a leaf, or an entry of a level above them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+struct ChainingValue([u8; 32]);
+
+impl ChainingValue {
+    // Hashed at the block's offset in the content, so the same bytes at another index hash
+    // differently, and the value is the one BLAKE3 computes for this subtree of the whole
+    // content, so a block verifies on its own.
+    fn from_block(block: &Block) -> Self {
+        let mut h = Blake3Hasher::new();
+        h.set_input_offset((block.index.0 * BLOCK_SIZE) as u64);
+        h.update(block.bytes);
+        Self(h.finalize_non_root())
     }
-    total
+
+    fn merge(left: &Self, right: &Self) -> Self {
+        Self(merge_subtrees_non_root(&left.0, &right.0, Mode::Hash))
+    }
+
+    fn read(bytes: &[u8], at: usize) -> Self {
+        Self(bytes[at..at + CV_LEN].try_into().unwrap())
+    }
 }
 
-fn tree_file_size_v2(n_leaves: usize) -> usize {
-    60 + tree_file_size(n_leaves)
+// Always blake3::hash(content), so blake3/<x> and blake3_tree_v2/<x> share one digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+struct Root([u8; 32]);
+
+impl Root {
+    // two or more blocks
+    fn from_top(top: [ChainingValue; 2]) -> Self {
+        Self(*merge_subtrees_root(&top[0].0, &top[1].0, Mode::Hash).as_bytes())
+    }
+
+    // One block has nothing to merge, so its leaf is no input to the root and nothing binds
+    // it to the id. The block itself is checked against the root instead.
+    fn from_single_block(block: &Block) -> Self {
+        Self(*blake3::hash(block.bytes).as_bytes())
+    }
+
+    fn from_id(hex: &str) -> Option<Self> {
+        hex.parse::<blake3::Hash>().ok().map(|h| Self(*h.as_bytes()))
+    }
 }
 
-// A blake3_tree_v2 id names a tree file's magic, root and levels. Header bytes 4..32 are
-// reserved: written zero, never read, never a reason to reject a tree. The id cannot cover
-// them, so they are zeroed wherever tree bytes are stored or sent, whatever a peer sent or
-// an older node stored. `data` is the part of a tree file that starts at byte `offset`.
+impl std::fmt::Display for Root {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", blake3::Hash::from_bytes(self.0))
+    }
+}
+
+// Level sizes, leaves first. Each level up has half the entries rounded up: pairs merge
+// left to right and an odd last entry is copied up unmerged, until two remain. That is
+// BLAKE3's own tree shape, which is why the top two merge to blake3::hash(content).
+// 9 blocks: 9, 5, 3, 2.
+struct TreeShape {
+    level_sizes: Vec<usize>,
+}
+
+impl TreeShape {
+    fn for_blocks(blocks: usize) -> Self {
+        let mut level_sizes = vec![blocks];
+        while *level_sizes.last().unwrap() > 2 {
+            level_sizes.push(level_sizes.last().unwrap().div_ceil(2));
+        }
+        Self { level_sizes }
+    }
+
+    // The content is ((blocks-1)*BLOCK_SIZE, blocks*BLOCK_SIZE] bytes; its last block, which
+    // its leaf (or for one block, the root) binds, gives the exact length.
+    fn blocks(&self) -> usize {
+        self.level_sizes[0]
+    }
+
+    fn file_len(&self) -> usize {
+        TREE_HEADER_LEN + CV_LEN * self.level_sizes.iter().sum::<usize>()
+    }
+
+    // The block count is not stored. File length grows strictly with it, so it comes back.
+    fn from_file_len(len: usize) -> Option<Self> {
+        if len < Self::for_blocks(1).file_len() {
+            return None;
+        }
+        let mut n = ((len - TREE_HEADER_LEN) / 64).max(1);
+        while Self::for_blocks(n).file_len() < len {
+            n += 1;
+        }
+        while n > 0 && Self::for_blocks(n).file_len() > len {
+            n -= 1;
+        }
+        let shape = Self::for_blocks(n);
+        (shape.file_len() == len).then_some(shape)
+    }
+
+    // Where each level starts, leaves first. Levels are stored top first after the header,
+    // leaves last, so offsets count back from the end.
+    fn level_offsets(&self, file_len: usize) -> Vec<usize> {
+        let mut from_end = 0;
+        self.level_sizes
+            .iter()
+            .map(|size| {
+                from_end += size * CV_LEN;
+                file_len - from_end
+            })
+            .collect()
+    }
+}
+
+// Bytes 4..32 of a tree file are reserved. The id cannot cover them (the root is
+// blake3::hash of the content, so nothing else in the file is bound to it), so two files
+// that differ only there pass the same check. They are written as zero, never read, never
+// a reason to reject a tree, and zeroed here wherever tree bytes are stored (a received
+// tree, before it moves to public/) or sent (Content::new_block), whatever a peer sent or
+// an older node stored. Kept and re-served as received, they would let a peer stamp each
+// copy it serves (224 bits) and learn who fetched from whom, make one id name many files so
+// byte-for-byte compare and dedup break, have honest nodes store and spread 28 bytes of
+// arbitrary data, and leave garbage in cached trees if a later format gave them a meaning.
+// Block size and content length do not go here: a length the id cannot cover is an
+// unverified hint, and another block size needs a new magic. The HTTP gateway serves no
+// tree files. `data` is the part of a tree file that starts at byte `offset`.
 fn zero_tree_v2_reserved_bytes(data: &mut [u8], offset: usize) {
     let start = offset.max(4);
     let end = offset.saturating_add(data.len()).min(32);
@@ -1346,82 +1456,134 @@ fn zero_tree_v2_reserved_bytes(data: &mut [u8], offset: usize) {
     }
 }
 
-// Fills in the 64-byte v2 header and all intermediate levels of a tree mmap whose leaf
-// section (last n_leaves*32 bytes) has already been written by the caller.
-// Writes magic, reserved zeroes, and (for n_leaves>=2) the computed root hash.
-// For n_leaves==1 the root is blake3::hash(content) which the caller must write to [32..64].
-// Returns the blake3 root hash for n_leaves >= 2; None for n_leaves == 1.
-fn finalize_tree_mmap_v2(mmap: &mut MmapMut, n_leaves: usize) -> Option<blake3::Hash> {
-    mmap[0..4].copy_from_slice(b"B3T\x02");
-    mmap[4..32].fill(0);
-    if n_leaves < 2 {
+// Writes the header and every level above the leaves, which are already in the last
+// shape.blocks() entries of `tree`. None for one block, whose root is not a merge.
+fn write_tree_levels(tree: &mut [u8], shape: &TreeShape) -> Option<Root> {
+    tree[0..4].copy_from_slice(&TREE_MAGIC);
+    tree[4..32].fill(0);
+    if shape.blocks() < 2 {
         return None;
     }
-    let total = mmap.len();
-    let mut level_sizes: Vec<usize> = vec![n_leaves];
-    while *level_sizes.last().unwrap() > 2 {
-        let n = *level_sizes.last().unwrap();
-        level_sizes.push((n + 1) / 2);
-    }
-    let mut offsets: Vec<usize> = Vec::with_capacity(level_sizes.len());
-    let mut from_end = 0;
-    for &s in &level_sizes {
-        from_end += s * 32;
-        offsets.push(total - from_end);
-    }
-    for k in 0..level_sizes.len() - 1 {
-        let src = offsets[k];
-        let dst = offsets[k + 1];
-        let n = level_sizes[k];
-        for i in 0..n / 2 {
-            let l: [u8; 32] = mmap[src + 2 * i * 32..src + (2 * i + 1) * 32]
-                .try_into()
-                .unwrap();
-            let r: [u8; 32] = mmap[src + (2 * i + 1) * 32..src + (2 * i + 2) * 32]
-                .try_into()
-                .unwrap();
-            mmap[dst + i * 32..dst + (i + 1) * 32].copy_from_slice(&merge_subtrees_non_root(
-                &l,
-                &r,
-                Mode::Hash,
-            ));
+    let offsets = shape.level_offsets(tree.len());
+    for k in 0..shape.level_sizes.len() - 1 {
+        let (src, dst, n) = (offsets[k], offsets[k + 1], shape.level_sizes[k]);
+        for j in 0..n / 2 {
+            let left = ChainingValue::read(tree, src + 2 * j * CV_LEN);
+            let right = ChainingValue::read(tree, src + (2 * j + 1) * CV_LEN);
+            tree[dst + j * CV_LEN..dst + (j + 1) * CV_LEN]
+                .copy_from_slice(&ChainingValue::merge(&left, &right).0);
         }
         if n % 2 == 1 {
-            let last: [u8; 32] = mmap[src + (n - 1) * 32..src + n * 32].try_into().unwrap();
-            mmap[dst + (n / 2) * 32..dst + (n / 2 + 1) * 32].copy_from_slice(&last);
+            let last = ChainingValue::read(tree, src + (n - 1) * CV_LEN);
+            tree[dst + (n / 2) * CV_LEN..dst + (n / 2 + 1) * CV_LEN].copy_from_slice(&last.0);
         }
     }
     let top = *offsets.last().unwrap();
-    let a: [u8; 32] = mmap[top..top + 32].try_into().unwrap();
-    let b: [u8; 32] = mmap[top + 32..top + 64].try_into().unwrap();
-    let root = merge_subtrees_root(&a, &b, Mode::Hash);
-    mmap[32..64].copy_from_slice(root.as_bytes());
+    let root = Root::from_top([
+        ChainingValue::read(tree, top),
+        ChainingValue::read(tree, top + CV_LEN),
+    ]);
+    tree[32..64].copy_from_slice(&root.0);
     Some(root)
 }
 
-// Derive n_leaves from a v2 tree file's eof. Walks upward from approximation.
-fn n_leaves_from_tree_v2_eof(eof: usize) -> Option<usize> {
-    if eof < tree_file_size_v2(1) {
-        return None;
+// Writes the whole tree file for `content` into `tree`, which is TreeShape::file_len long,
+// and returns its root. If sha256 is Some, updates it with every block in the same pass.
+// Apart from the file handling in build_tree_from_mmap so tests build trees with it too.
+fn write_tree_v2(tree: &mut [u8], content: &[u8], mut sha256: Option<&mut Sha256>) -> Root {
+    let shape = TreeShape::for_blocks(ContentLen(content.len()).blocks());
+    let leaf_base = tree.len() - shape.blocks() * CV_LEN;
+    for block in Block::all(content) {
+        if let Some(ref mut h) = sha256 {
+            h.update(block.bytes);
+        }
+        let at = leaf_base + block.index.0 * CV_LEN;
+        tree[at..at + CV_LEN].copy_from_slice(&ChainingValue::from_block(&block).0);
     }
-    let target = eof - 60;
-    let mut n = (target.saturating_sub(4) / 64).max(1);
-    while tree_file_size(n) < target {
-        n += 1;
-    }
-    while n > 0 && tree_file_size(n) > target {
-        n -= 1;
-    }
-    if tree_file_size(n) == target {
-        Some(n)
-    } else {
-        None
+    match write_tree_levels(tree, &shape) {
+        Some(root) => root,
+        None => {
+            let root = Root::from_single_block(&Block { index: BlockIndex(0), bytes: content });
+            tree[32..64].copy_from_slice(&root.0);
+            root
+        }
     }
 }
 
-// Recursive top-down consistency check for tree v2 files.
-// Returns true if stored[level][idx] equals merge_non_root of its children.
-// Adds suspect 4KB block indices to `bad` on inconsistency.
+// Tree bytes from a peer. check() is the only way to a CheckedTreeFile.
+struct UncheckedTreeFile<B>(B);
+
+// A tree file whose leaves are all bound to its root (for one block, only the root):
+// what content blocks are checked against.
+struct CheckedTreeFile<B> {
+    bytes: B,
+    shape: TreeShape,
+}
+
+impl<B: AsRef<[u8]>> UncheckedTreeFile<B> {
+    // Returns the tree, or the bytes back with the tree file's 4KB blocks suspected bad.
+    // Bytes 4..32 are not checked.
+    fn check(self, id: &Root) -> Result<CheckedTreeFile<B>, (B, Vec<usize>)> {
+        let data = self.0.as_ref();
+        // 1. a length some block count gives
+        let Some(shape) = TreeShape::from_file_len(data.len()) else {
+            error!("tree check: no block count gives a {} byte tree file", data.len());
+            return Err((self.0, vec![0]));
+        };
+        // 2. the magic
+        if data[0..4] != TREE_MAGIC {
+            warn!("check_tree_v2_data: bad magic {:02x}{:02x}{:02x}{:02x} len={}", data[0], data[1], data[2], data[3], data.len());
+            let all = (0..data.len().div_ceil(BLOCK_SIZE)).collect();
+            return Err((self.0, all));
+        }
+        let n_leaves = shape.blocks();
+        let mut bad: HashSet<usize> = HashSet::new();
+        // 3. the header root is the id
+        let header_hash_bad = data[32..64] != id.0;
+        if header_hash_bad {
+            warn!("check_tree_v2_data: root hash mismatch in block0 header: stored={} expected={} n_leaves={} len={}", hex::encode(&data[32..64]), id, n_leaves, data.len());
+            bad.insert(0);
+        }
+        if n_leaves >= 2 {
+            let offsets = shape.level_offsets(data.len());
+            let top = shape.level_sizes.len() - 1;
+            // 4. every entry is the merge of its children, or the copy of an odd last child
+            let pre_tree_bad_count = bad.len();
+            tree_check_subtree(data, &shape.level_sizes, &offsets, top, 0, &mut bad);
+            tree_check_subtree(data, &shape.level_sizes, &offsets, top, 1, &mut bad);
+            if bad.len() > pre_tree_bad_count {
+                let mut bad_sorted: Vec<usize> = bad.iter().copied().collect();
+                bad_sorted.sort();
+                let block0_from_tree = !header_hash_bad && bad_sorted.contains(&0);
+                warn!("check_tree_v2_data: tree structure fail n_leaves={} len={} bad_blocks={:?} block0_from_tree={}", n_leaves, data.len(), bad_sorted, block0_from_tree);
+                // Top-level hashes are at bytes 64..128 (always block 0). When only leaf/mid blocks
+                // are bad, block 0 is a propagated side effect, not genuinely corrupt.
+                if block0_from_tree {
+                    let non_zero_bad: Vec<usize> = bad_sorted.iter().copied().filter(|&b| b != 0).collect();
+                    warn!("check_tree_v2_data: block0 added by tree propagation, actual suspect blocks: {:?}", non_zero_bad);
+                }
+            }
+            // 5. the top two merge to the root, or a consistent tree for other content passes
+            if !top_merges_to(data, offsets[top], id) {
+                warn!("check_tree_v2_data: top level does not merge to the root n_leaves={}", n_leaves);
+                bad.insert(0);
+            }
+        }
+        if bad.is_empty() {
+            Ok(CheckedTreeFile { bytes: self.0, shape })
+        } else {
+            Err((self.0, bad.into_iter().collect()))
+        }
+    }
+}
+
+fn top_merges_to(data: &[u8], top: usize, root: &Root) -> bool {
+    Root::from_top([ChainingValue::read(data, top), ChainingValue::read(data, top + CV_LEN)]) == *root
+}
+
+// Recursive top-down consistency check of the levels.
+// Returns true if stored[level][idx] equals the merge of its children (or its copied child).
+// Adds suspect 4KB block indices of the tree file to `bad` on inconsistency.
 fn tree_check_subtree(
     data: &[u8],
     level_sizes: &[usize],
@@ -1437,148 +1599,158 @@ fn tree_check_subtree(
     let ri = li + 1;
     let co = offsets[level - 1];
     let po = offsets[level];
-    // an odd last entry is copied up unmerged, so its parent must equal it
     let odd = ri >= level_sizes[level - 1];
-    let l: [u8; 32] = data[co + li * 32..co + (li + 1) * 32].try_into().unwrap();
-    let p: [u8; 32] = data[po + idx * 32..po + (idx + 1) * 32].try_into().unwrap();
+    let l = ChainingValue::read(data, co + li * CV_LEN);
+    let p = ChainingValue::read(data, po + idx * CV_LEN);
     let l_ok = tree_check_subtree(data, level_sizes, offsets, level - 1, li, bad);
     let r_ok = odd || tree_check_subtree(data, level_sizes, offsets, level - 1, ri, bad);
     let expected = if odd {
         l
     } else {
-        let r: [u8; 32] = data[co + ri * 32..co + (ri + 1) * 32].try_into().unwrap();
-        merge_subtrees_non_root(&l, &r, Mode::Hash)
+        ChainingValue::merge(&l, &ChainingValue::read(data, co + ri * CV_LEN))
     };
     if expected == p {
         return true;
     }
-    bad.insert((po + idx * 32) / BLOCK_SIZE!());
+    bad.insert((po + idx * CV_LEN) / BLOCK_SIZE);
     if l_ok && r_ok {
-        bad.insert((co + li * 32) / BLOCK_SIZE!());
-        bad.insert((co + (li + !odd as usize) * 32) / BLOCK_SIZE!());
+        bad.insert((co + li * CV_LEN) / BLOCK_SIZE);
+        bad.insert((co + (li + !odd as usize) * CV_LEN) / BLOCK_SIZE);
     }
     false
 }
 
-// Check the header hash and parent-child consistency of a tree v2 data slice.
-// Returns the set of 4KB block indices suspected bad. Empty = all good, rename to public.
-fn check_tree_v2_data(data: &[u8], expected_hash: &str, n_leaves: usize) -> Vec<usize> {
-    if data.len() < 64 || &data[0..4] != b"B3T\x02" {
-        warn!("check_tree_v2_data: bad magic {:02x}{:02x}{:02x}{:02x} len={}", data.get(0).copied().unwrap_or(0), data.get(1).copied().unwrap_or(0), data.get(2).copied().unwrap_or(0), data.get(3).copied().unwrap_or(0), data.len());
-        return (0..(data.len() + BLOCK_SIZE!() - 1) / BLOCK_SIZE!()).collect();
+impl<B: AsRef<[u8]>> CheckedTreeFile<B> {
+    fn root(&self) -> Root {
+        Root(self.bytes.as_ref()[32..64].try_into().unwrap())
     }
-    let expected: blake3::Hash = match expected_hash.parse() {
-        Ok(h) => h,
-        Err(_) => return vec![],
-    };
-    let mut bad: HashSet<usize> = HashSet::new();
-    let header_hash_bad = data[32..64] != *expected.as_bytes();
-    if header_hash_bad {
-        warn!("check_tree_v2_data: root hash mismatch in block0 header: stored={} expected={} n_leaves={} len={}", hex::encode(&data[32..64]), expected_hash, n_leaves, data.len());
-        bad.insert(0);
+
+    fn leaf(&self, index: BlockIndex) -> Option<ChainingValue> {
+        let bytes = self.bytes.as_ref();
+        let n = self.shape.blocks();
+        (index.0 < n).then(|| ChainingValue::read(bytes, bytes.len() - (n - index.0) * CV_LEN))
     }
-    if n_leaves < 2 {
-        return bad.into_iter().collect();
-    }
-    let total = data.len();
-    let mut level_sizes = vec![n_leaves];
-    while *level_sizes.last().unwrap() > 2 {
-        let last = *level_sizes.last().unwrap();
-        level_sizes.push((last + 1) / 2);
-    }
-    let mut offsets = Vec::with_capacity(level_sizes.len());
-    let mut from_end = 0usize;
-    for &s in &level_sizes {
-        from_end += s * 32;
-        offsets.push(total - from_end);
-    }
-    let l = level_sizes.len();
-    let pre_tree_bad_count = bad.len();
-    tree_check_subtree(data, &level_sizes, &offsets, l - 1, 0, &mut bad);
-    tree_check_subtree(data, &level_sizes, &offsets, l - 1, 1, &mut bad);
-    if bad.len() > pre_tree_bad_count {
-        let mut bad_sorted: Vec<usize> = bad.iter().copied().collect();
-        bad_sorted.sort();
-        let block0_from_tree = !header_hash_bad && bad_sorted.contains(&0);
-        warn!("check_tree_v2_data: tree structure fail n_leaves={} len={} bad_blocks={:?} block0_from_tree={}", n_leaves, data.len(), bad_sorted, block0_from_tree);
-        // Top-level hashes are at bytes 64..128 (always block 0). When only leaf/mid blocks
-        // are bad, block 0 is a propagated side effect, not genuinely corrupt.
-        if block0_from_tree {
-            let non_zero_bad: Vec<usize> = bad_sorted.iter().copied().filter(|&b| b != 0).collect();
-            warn!("check_tree_v2_data: block0 added by tree propagation, actual suspect blocks: {:?}", non_zero_bad);
+
+    // None: the tree has no such block
+    fn block_matches(&self, block: &Block) -> Option<bool> {
+        if self.shape.blocks() == 1 {
+            return (block.index.0 == 0).then(|| Root::from_single_block(block) == self.root());
         }
+        Some(ChainingValue::from_block(block) == self.leaf(block.index)?)
     }
-    // the top level must merge to the root, or a consistent tree for other content passes
-    let t = offsets[l - 1];
-    let (a, b) = data[t..t + 64].split_at(32);
-    if merge_subtrees_root(a.try_into().unwrap(), b.try_into().unwrap(), Mode::Hash) != expected {
-        warn!("check_tree_v2_data: top level does not merge to the root n_leaves={}", n_leaves);
-        bad.insert(0);
+}
+
+impl CheckedTreeFile<MmapMut> {
+    fn zero_reserved_bytes(&mut self) {
+        zero_tree_v2_reserved_bytes(&mut self.bytes, 0);
     }
-    bad.into_iter().collect()
+
+    fn into_read_only(self) -> Option<CheckedTreeFile<Mmap>> {
+        let bytes = self.bytes.make_read_only().ok()?;
+        Some(CheckedTreeFile { bytes, shape: self.shape })
+    }
+}
+
+impl CheckedTreeFile<Mmap> {
+    // Only trees this node checked or built reach public/ through this code, so a stored
+    // tree is not checked level by level again, only that its length and root fit the id.
+    fn open_stored(id: &Root) -> Option<Self> {
+        let file = File::open(format!("./cjp2p/public/blake3_tree_v2/{}", id)).ok()?;
+        let bytes = unsafe { Mmap::map(&file) }.ok()?;
+        let shape = TreeShape::from_file_len(bytes.len())?;
+        (bytes[32..64] == id.0).then_some(Self { bytes, shape })
+    }
 }
 
 #[cfg(test)]
 mod tree_v2_tests {
     use super::*;
 
-    // The tree file for `content` and its leaf count, built in memory by the same
-    // write_tree_v2 that build_tree_from_mmap uses, so tests need no ./cjp2p directory.
-    fn tree_v2_for(content: &[u8]) -> (MmapMut, usize) {
-        let n_leaves = (content.len() + BLOCK_SIZE!() - 1) / BLOCK_SIZE!();
-        let mut tree = MmapMut::map_anon(tree_file_size_v2(n_leaves)).unwrap();
-        write_tree_v2(&mut tree, content, None);
-        (tree, n_leaves)
+    // Built in memory by the same write_tree_v2 build_tree_from_mmap uses.
+    fn tree_v2_for(content: &[u8]) -> (Vec<u8>, Root) {
+        let shape = TreeShape::for_blocks(ContentLen(content.len()).blocks());
+        let mut tree = vec![0; shape.file_len()];
+        let root = write_tree_v2(&mut tree, content, None);
+        (tree, root)
+    }
+
+    fn check(tree: &[u8], id: &Root) -> Result<(), Vec<usize>> {
+        UncheckedTreeFile(tree).check(id).map(|_| ()).map_err(|(_, bad)| bad)
+    }
+
+    // rule 4 alone
+    fn levels_consistent(tree: &[u8]) -> bool {
+        let shape = TreeShape::from_file_len(tree.len()).unwrap();
+        let offsets = shape.level_offsets(tree.len());
+        let top = shape.level_sizes.len() - 1;
+        let mut bad = HashSet::new();
+        tree_check_subtree(tree, &shape.level_sizes, &offsets, top, 0, &mut bad);
+        tree_check_subtree(tree, &shape.level_sizes, &offsets, top, 1, &mut bad);
+        bad.is_empty()
+    }
+
+    fn block(index: usize, bytes: &[u8]) -> Block<'_> {
+        Block { index: BlockIndex(index), bytes }
     }
 
     #[test]
     fn forged_trees_fail() {
         for blocks in [2, 3, 5, 6, 9] {
-            let good: Vec<u8> = (0..blocks * 4096 - 7).map(|i| (i % 251) as u8).collect();
-            let root = blake3::hash(&good).to_hex();
-            let (mut t, n) = tree_v2_for(&good);
-            assert!(check_tree_v2_data(&t, &root, n).is_empty());
-            // a consistent tree for other content, with the wanted root in its header
+            let good: Vec<u8> = (0..blocks * BLOCK_SIZE - 7).map(|i| (i % 251) as u8).collect();
+            let (mut tree, root) = tree_v2_for(&good);
+            assert!(check(&tree, &root).is_ok());
+
+            // A consistent tree for other content with the wanted root in its header passes
+            // rules 1-4. Only rule 5, the top merge, catches it.
             let (mut forged, _) = tree_v2_for(&good.iter().map(|b| b ^ 1).collect::<Vec<u8>>());
-            forged[32..64].copy_from_slice(&t[32..64]);
-            assert!(!check_tree_v2_data(&forged, &root, n).is_empty());
-            // a changed last leaf, which is copied up unmerged when the count is odd
-            let last = t.len() - 1;
-            t[last] ^= 1;
-            assert!(!check_tree_v2_data(&t, &root, n).is_empty());
+            forged[32..64].copy_from_slice(&root.0);
+            assert!(levels_consistent(&forged));
+            assert!(check(&forged, &root).is_err());
+
+            let last = tree.len() - 1;
+            tree[last] ^= 1;
+            assert!(check(&tree, &root).is_err());
+            if blocks % 2 == 1 {
+                // An odd last leaf feeds no merge and the top pair is untouched, so only the
+                // copy comparison in rule 4 sees it changed.
+                let offsets = TreeShape::for_blocks(blocks).level_offsets(tree.len());
+                assert!(top_merges_to(&tree, *offsets.last().unwrap(), &root));
+                assert!(!levels_consistent(&tree));
+            }
         }
     }
 
     #[test]
     fn one_block_trees_work() {
         for n in 1..=300 {
-            assert_eq!(n_leaves_from_tree_v2_eof(tree_file_size_v2(n)), Some(n));
+            let len = TreeShape::for_blocks(n).file_len();
+            assert_eq!(TreeShape::from_file_len(len).map(|s| s.blocks()), Some(n));
         }
-        for data in [vec![7u8], vec![7u8; 4096]] {
-            let (tree, _) = tree_v2_for(&data);
-            let (tree, root) = (tree.make_read_only().unwrap(), blake3::hash(&data).to_hex());
-            assert!(check_tree_v2_data(&tree, &root, 1).is_empty());
-            assert_eq!(block_matches_tree_v2(&tree, &root, 0, &data), Some(true));
-            assert_eq!(block_matches_tree_v2(&tree, &root, 0, &data[1..]), Some(false));
-            assert_eq!(block_matches_tree_v2(&tree, &root, 1, &data), None);
+        for data in [vec![7u8], vec![7u8; BLOCK_SIZE]] {
+            let (tree, root) = tree_v2_for(&data);
+            let checked = UncheckedTreeFile(&tree[..]).check(&root).ok().unwrap();
+            assert_eq!(checked.block_matches(&block(0, &data)), Some(true));
+            assert_eq!(checked.block_matches(&block(0, &data[1..])), Some(false));
+            assert_eq!(checked.block_matches(&block(1, &data)), None);
+
+            // the leaf is no input to the root, so a changed leaf still passes
+            let mut changed = tree.clone();
+            let last = changed.len() - 1;
+            changed[last] ^= 1;
+            assert!(check(&changed, &root).is_ok());
         }
     }
 
     #[test]
     fn reserved_bytes_are_accepted_then_zeroed() {
-        let content: Vec<u8> = (0..3 * BLOCK_SIZE!() + 100)
-            .map(|i| (i % 251) as u8)
-            .collect();
-        let (tree, n_leaves) = tree_v2_for(&content);
-        let root = blake3::hash(&content).to_hex();
-        let built = tree.to_vec();
+        let content: Vec<u8> = (0..3 * BLOCK_SIZE + 100).map(|i| (i % 251) as u8).collect();
+        let (built, root) = tree_v2_for(&content);
         assert!(built[4..32].iter().all(|&b| b == 0));
 
         // same magic, root and levels as built, with arbitrary bytes in the reserved range
         let mut doctored = built.clone();
         doctored[4..32].fill(0xa5);
-        assert_eq!(n_leaves_from_tree_v2_eof(doctored.len()), Some(n_leaves));
-        assert!(check_tree_v2_data(&doctored, &root, n_leaves).is_empty());
+        assert!(check(&doctored, &root).is_ok());
 
         // stored: the whole file, zeroed back to what this node would have built
         let mut stored = doctored.clone();
@@ -1594,75 +1766,65 @@ mod tree_v2_tests {
         }
     }
 
-    // Content for the vectors in docs/blake3_tree_v2.md.
     fn vector_content(len: usize) -> Vec<u8> {
         (0..len)
             .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
             .collect()
     }
 
-    // The root is blake3::hash of the content, which is why blake3/<x> and
-    // blake3_tree_v2/<x> share a digest. With two or more blocks the root is merged from
-    // the leaves, so this fails if leaf hashing or pairing drifts from BLAKE3's own tree.
-    // One block has nothing to merge and write_tree_v2 writes blake3::hash itself, so
-    // asserting it there would only repeat that; the vectors below pin those files.
+    // With two or more blocks the root is merged from the levels, so this is what ties
+    // blake3/<x> to blake3_tree_v2/<x>. One block writes blake3::hash itself.
     #[test]
     fn tree_root_is_blake3_of_the_content() {
         for len in [4097, 8192, 8193, 12288, 20487, 36864, 69627, 4096003] {
             let content = vector_content(len);
-            let (tree, n_leaves) = tree_v2_for(&content);
-            assert!(n_leaves >= 2, "len={len}");
-            assert_eq!(tree[32..64], *blake3::hash(&content).as_bytes(), "len={len}");
+            let (tree, root) = tree_v2_for(&content);
+            assert!(ContentLen(len).blocks() >= 2, "len={len}");
+            assert_eq!(root.0, *blake3::hash(&content).as_bytes(), "len={len}");
+            assert_eq!(tree[32..64], root.0, "len={len}");
         }
     }
 
-    // Frozen tree files from docs/blake3_tree_v2.md, so a change that keeps the root
-    // but moves any byte of the file fails too. Every row is checked.
+    // Frozen roots and tree files, so a change that keeps the root but moves any byte of
+    // the file fails too.
     #[test]
     fn tree_files_match_the_documented_vectors() {
         let vectors = [
-            (1, "f9bdfcba1505cc664da89bd5df105be977f92897b086075d8f5a1f269b558617"),
-            (4095, "a01d7cd85bd5658ded393a72b4c29d08ff56c11051e909eb9c6b9cb7558d4c10"),
-            (4096, "522ea88ecf2d1e1aac04999a7aedd94737f9fb7103845514a9e40e9debb3aaaa"),
-            (4097, "87f802b424302b94c4868dc06198717fdf4ab560e0222e4aad97a17cecbd5acd"),
-            (12288, "5d48cc4c90539edbc02964d82e6afc66c488c64aa9e61c502d8cee2b7d626a4d"),
-            (20487, "12b0d11acc8d51874e79b02b88bde5245539cd838e4838dda0bfbe8d2a35a5c8"),
-            (36864, "6e0289148cd873e7e767f59b3696b6f886731952599051b0e08fac2a8b2796dc"),
-            (4096003, "2889acac4c8013e2e03dbe27ea48675b9da9b61e904ffcceb39271bbe9a7f587"),
+            (1, 96, "448bd8dd9624154a690f8e84dc52d6f633ba7cd545c4d3c9b4e0f6a2f6fa71f4", "f9bdfcba1505cc664da89bd5df105be977f92897b086075d8f5a1f269b558617"),
+            (4095, 96, "6efc183b62499b5310040ca725bb0a81a7c89cb3f163e92ea982da58aa7fea47", "a01d7cd85bd5658ded393a72b4c29d08ff56c11051e909eb9c6b9cb7558d4c10"),
+            (4096, 96, "d0c362f7235cbf7df3b8aabcefa9be7485c1c3c82983d42a519345929fb2fc1f", "522ea88ecf2d1e1aac04999a7aedd94737f9fb7103845514a9e40e9debb3aaaa"),
+            (4097, 128, "3000e690809e62e93e015f60ad2710797d6b3524c780b3bbb941154616c8a2e2", "87f802b424302b94c4868dc06198717fdf4ab560e0222e4aad97a17cecbd5acd"),
+            (12288, 224, "f086206b0b63bd77b988419f18edc36d195912da59c8168683cd2d02698d202a", "5d48cc4c90539edbc02964d82e6afc66c488c64aa9e61c502d8cee2b7d626a4d"),
+            (20487, 416, "02f8de9766f8783781e7e688a750cec3b5691614a8d8fc1ed005238b764095c9", "12b0d11acc8d51874e79b02b88bde5245539cd838e4838dda0bfbe8d2a35a5c8"),
+            (36864, 672, "2de1db0507feb1f2307d0dc411de1134b0ac4865637599a8f4e1bd6921840a6c", "6e0289148cd873e7e767f59b3696b6f886731952599051b0e08fac2a8b2796dc"),
+            (4096003, 64192, "25b1cc95e2318ea600527d41f7586c06cebe37e88567b3b75efdb64eb41925cd", "2889acac4c8013e2e03dbe27ea48675b9da9b61e904ffcceb39271bbe9a7f587"),
         ];
-        for (len, tree_file_hash) in vectors {
-            let (tree, _) = tree_v2_for(&vector_content(len));
+        for (len, file_len, root, tree_file_hash) in vectors {
+            let (tree, built_root) = tree_v2_for(&vector_content(len));
+            assert_eq!(tree.len(), file_len, "len={len}");
+            assert_eq!(built_root.to_string(), root, "len={len}");
             assert_eq!(blake3::hash(&tree).to_hex().as_str(), tree_file_hash, "len={len}");
         }
     }
-}
 
-// Writes the whole tree file for `content` into `tree`, which is tree_file_size_v2 long,
-// and returns its root. If sha256 is Some, updates it with every block in the same pass.
-// Apart from the file handling in build_tree_from_mmap so tests build trees with it too.
-fn write_tree_v2(
-    tree: &mut MmapMut,
-    content: &[u8],
-    mut sha256: Option<&mut Sha256>,
-) -> blake3::Hash {
-    let n_leaves = (content.len() + BLOCK_SIZE!() - 1) / BLOCK_SIZE!();
-    let leaf_base = tree.len() - n_leaves * 32;
-    let mut offset: u64 = 0;
-    for (i, chunk) in content.chunks(BLOCK_SIZE!()).enumerate() {
-        if let Some(ref mut h) = sha256 {
-            h.update(chunk);
-        }
-        let cv = block_chaining_value(chunk, offset);
-        tree[leaf_base + i * 32..leaf_base + (i + 1) * 32].copy_from_slice(&cv);
-        offset += chunk.len() as u64;
+    // The whole layout of one file. Blocks 0 and 1 are identical bytes (the content
+    // repeats every 256), yet leaves 0 and 1 differ: offset hashing.
+    #[test]
+    fn three_block_tree_file_layout() {
+        let content = vector_content(12288);
+        assert_eq!(content[..BLOCK_SIZE], content[BLOCK_SIZE..2 * BLOCK_SIZE]);
+        let (tree, _) = tree_v2_for(&content);
+        let expected = concat!(
+            "4233540200000000000000000000000000000000000000000000000000000000", // magic, reserved
+            "f086206b0b63bd77b988419f18edc36d195912da59c8168683cd2d02698d202a", // root
+            "b3b4f71ea4c00a22a4c9742446386530edb63c9f69438d4b0e94c96597bca83a", // merge of leaves 0, 1
+            "39d029994cb50ec1d94e6248b5e1d8d8e737dd1ae21687f8b715bdb19638db91", // leaf 2 copied up
+            "21037dd36783e18b6b63720b39f87e8cc2c470f2501a089528599f5d25b69425", // leaf 0
+            "53f1be5e8b614d0dbd88806f45e90ba722d04d2bb42972b1394d2bb70129a18a", // leaf 1
+            "39d029994cb50ec1d94e6248b5e1d8d8e737dd1ae21687f8b715bdb19638db91", // leaf 2
+        );
+        assert_eq!(hex::encode(&tree), expected);
     }
-    if let Some(root) = finalize_tree_mmap_v2(tree, n_leaves) {
-        return root;
-    }
-    // one block: nothing to merge, so the root is the content's own hash
-    let root = blake3::hash(content);
-    tree[32..64].copy_from_slice(root.as_bytes());
-    root
 }
 
 // Build the tree file from a source mmap in one pass.
@@ -1673,7 +1835,6 @@ fn build_tree_from_mmap(
     file_size: usize,
     sha256: Option<&mut Sha256>,
 ) -> Option<String> {
-    let n_leaves = (file_size + BLOCK_SIZE!() - 1) / BLOCK_SIZE!();
     let tree_tmp = format!("./cjp2p/public/.tmp_tree_{:016x}", rand::rng().random::<u64>());
     let tf = OpenOptions::new()
         .create(true)
@@ -1681,7 +1842,7 @@ fn build_tree_from_mmap(
         .write(true)
         .open(&tree_tmp)
         .ok()?;
-    let tsize = tree_file_size_v2(n_leaves);
+    let tsize = TreeShape::for_blocks(ContentLen(file_size).blocks()).file_len();
     tf.set_len(tsize as u64).ok()?;
     let mut tmm = unsafe { MmapMut::map_mut(&tf) }.ok()?;
     let blake3_id = format!("{}", write_tree_v2(&mut tmm, &src[..file_size], sha256));
@@ -1788,7 +1949,7 @@ fn handle_upload(mut stream: TcpStream, req: HttpRequest) {
                 .ok();
             return;
         }
-        let n_leaves = (content_length + BLOCK_SIZE!() - 1) / BLOCK_SIZE!();
+        let n_leaves = ContentLen(content_length).blocks();
         let tree_tmp = format!("./cjp2p/public/.tmp_tree_{:016x}", rand::rng().random::<u64>());
         let tf = match OpenOptions::new()
             .create(true)
@@ -1805,7 +1966,7 @@ fn handle_upload(mut stream: TcpStream, req: HttpRequest) {
                 return;
             }
         };
-        let tsize = tree_file_size_v2(n_leaves);
+        let tsize = TreeShape::for_blocks(n_leaves).file_len();
         tf.set_len(tsize as u64).ok();
         let mut tree_mmap = unsafe { MmapMut::map_mut(&tf) }.unwrap();
         let leaf_base = tsize - n_leaves * 32;
@@ -1820,9 +1981,9 @@ fn handle_upload(mut stream: TcpStream, req: HttpRequest) {
         let mut block_offset: u64 = 0;
         let mut leaf_count = 0usize;
         {
-            let mut on_leaf = |cv: [u8; 32]| {
-                tree_mmap[leaf_base + leaf_count * 32..leaf_base + (leaf_count + 1) * 32]
-                    .copy_from_slice(&cv);
+            let mut on_leaf = |cv: ChainingValue| {
+                tree_mmap[leaf_base + leaf_count * CV_LEN..leaf_base + (leaf_count + 1) * CV_LEN]
+                    .copy_from_slice(&cv.0);
                 leaf_count += 1;
             };
             let mut block = [0u8; BLOCK_SIZE!()];
@@ -1857,7 +2018,10 @@ fn handle_upload(mut stream: TcpStream, req: HttpRequest) {
                 if fill == 0 {
                     break;
                 }
-                on_leaf(block_chaining_value(&block[..fill], block_offset));
+                on_leaf(ChainingValue::from_block(&Block {
+                    index: BlockIndex(block_offset as usize / BLOCK_SIZE),
+                    bytes: &block[..fill],
+                }));
                 block_offset += fill as u64;
                 fill = 0;
                 if written >= content_length {
@@ -1868,12 +2032,13 @@ fn handle_upload(mut stream: TcpStream, req: HttpRequest) {
         drop(file);
         let sha256 = format!("{:x}", sha256_hasher.finalize());
         let blake3 = if leaf_count == 1 {
-            finalize_tree_mmap_v2(&mut tree_mmap, 1);
+            write_tree_levels(&mut tree_mmap, &TreeShape::for_blocks(1));
             let h = blake3_hasher.unwrap().finalize();
             tree_mmap[32..64].copy_from_slice(h.as_bytes());
             format!("{}", h)
         } else {
-            format!("{}", finalize_tree_mmap_v2(&mut tree_mmap, leaf_count).unwrap())
+            let shape = TreeShape::for_blocks(leaf_count);
+            format!("{}", write_tree_levels(&mut tree_mmap, &shape).unwrap())
         };
         drop(tree_mmap);
         drop(tf);
@@ -4272,7 +4437,7 @@ impl Content {
         if req.id.starts_with("blake3_tree_v2/")
             && req.offset == 0
             && buf.len() >= 4
-            && &buf[..4] != b"B3T\x02"
+            && buf[..4] != TREE_MAGIC
         {
             warn!("SERVING block0 of {} with bad magic {:02x}{:02x}{:02x}{:02x} len={} file_eof={}", req.id, buf[0], buf[1], buf[2], buf[3], buf.len(), ofr.eof);
         }
@@ -4451,50 +4616,52 @@ impl Receive for Content {
             let block_number = self.offset / BLOCK_SIZE!();
             debug!( "\x1b[34mreceived block {:?} {:?} {:?} from {:?} window \x1b[7m{:}\x1b[m", self.id, block_number, block_number * BLOCK_SIZE!(), src, i.next_block as i64 - block_number as i64);
             message_out = i.receive_content(&self, ps);
-            let tree_eof = i.eof;
             if i.bytes_complete == i.eof && i.eof > 0 && self.id.starts_with("blake3_tree_v2/") {
                 let hash = self.id["blake3_tree_v2/".len()..].to_string();
-                let bad: Vec<usize> = match (
-                    n_leaves_from_tree_v2_eof(tree_eof),
-                    inbound_states.get(&self.id).unwrap().mmap.as_deref(),
-                ) {
-                    (Some(n), Some(data)) => check_tree_v2_data(data, &hash, n),
-                    (None, _) => {
-                        error!("{} cannot derive n_leaves from eof {}", self.id, tree_eof);
-                        vec![0]
+                let verdict = match (Root::from_id(&hash), i.mmap.take()) {
+                    (Some(id), Some(mm)) => {
+                        UncheckedTreeFile(mm).check(&id).map_err(|(mm, bad)| (Some(mm), bad))
+                    }
+                    (None, mm) => {
+                        error!("{} is not a blake3 id", self.id);
+                        i.mmap = mm;
+                        Err((None, vec![0]))
                     }
                     (_, None) => {
                         error!("{} missing mmap",self.id);
-                        vec![0]
+                        Err((None, vec![0]))
                     }
                 };
-                if bad.is_empty() {
-                    if let Some(data) = inbound_states
-                        .get_mut(&self.id)
-                        .and_then(|ti| ti.mmap.as_deref_mut())
-                    {
-                        zero_tree_v2_reserved_bytes(data, 0);
-                    }
-                    let incoming = format!("./cjp2p/incoming/{}", self.id);
-                    let public = format!("./cjp2p/public/{}", self.id);
-                    if fs::rename(&incoming, &public).is_ok() {
-                        info!("{} tree complete", self.id);
-                        println!("{} tree complete", self.id);
-                        let content_id = format!("blake3/{}", hash);
-                        let ro_mmap = inbound_states
-                            .get_mut(&self.id)
-                            .and_then(|ti| ti.mmap.take())
-                            .and_then(|mm| mm.make_read_only().ok());
-                        if let Some(mm) = ro_mmap {
-                            if let Some(ci) = inbound_states.get_mut(&content_id) {
-                                ci.segment_hashes = Some(mm);
+                let bad = match verdict {
+                    Ok(mut tree) => {
+                        tree.zero_reserved_bytes();
+                        let incoming = format!("./cjp2p/incoming/{}", self.id);
+                        let public = format!("./cjp2p/public/{}", self.id);
+                        if fs::rename(&incoming, &public).is_ok() {
+                            info!("{} tree complete", self.id);
+                            println!("{} tree complete", self.id);
+                            let content_id = format!("blake3/{}", hash);
+                            if let Some(tree) = tree.into_read_only() {
+                                if let Some(ci) = inbound_states.get_mut(&content_id) {
+                                    ci.segment_hashes = Some(tree);
+                                }
                             }
+                        } else {
+                            inbound_states.get_mut(&self.id).unwrap().mmap = Some(tree.bytes);
                         }
+                        if let Some(ti) = inbound_states.get_mut(&self.id) {
+                            ti.done = true;
+                        }
+                        vec![]
                     }
-                    if let Some(ti) = inbound_states.get_mut(&self.id) {
-                        ti.done = true;
+                    Err((mm, bad)) => {
+                        if mm.is_some() {
+                            inbound_states.get_mut(&self.id).unwrap().mmap = mm;
+                        }
+                        bad
                     }
-                } else {
+                };
+                if !bad.is_empty() {
                     let Some(ti) = inbound_states.get_mut(&self.id) else {
                         error!("where did inbound_states go, this should never happen!");
                         return vec![];
@@ -4559,7 +4726,7 @@ struct InboundState {
     hash_failures: i32,
     hash_future: Option<std::sync::mpsc::Receiver<bool>>,
     verifying_mmap: Option<std::sync::Arc<Mmap>>,
-    segment_hashes: Option<Mmap>,
+    segment_hashes: Option<CheckedTreeFile<Mmap>>,
     done: bool,
 }
 
@@ -4922,12 +5089,7 @@ impl InboundState {
         };
         if id.starts_with("blake3/") {
             let hash = &id["blake3/".len()..];
-            let tree_path = format!("./cjp2p/public/blake3_tree_v2/{}", hash);
-            if let Ok(f) = File::open(&tree_path) {
-                if let Ok(mm) = unsafe { Mmap::map(&f) } {
-                    new_i.segment_hashes = Some(mm);
-                }
-            }
+            new_i.segment_hashes = Root::from_id(hash).and_then(|id| CheckedTreeFile::open_stored(&id));
             if new_i.segment_hashes.is_none() {
                 let tree_id = format!("blake3_tree_v2/{}", hash);
                 InboundState::new(&tree_id, ps, inbound_states);
@@ -4996,21 +5158,15 @@ impl InboundState {
         {
             if self.id.starts_with("blake3/") {
                 if self.segment_hashes.is_none() {
-                    let hash = &self.id["blake3/".len()..];
-                    if let Ok(f) = File::open(format!("./cjp2p/public/blake3_tree_v2/{}", hash)) {
-                        if let Ok(mm) = unsafe { Mmap::map(&f) } {
-                            self.segment_hashes = Some(mm);
-                        }
-                    }
+                    self.segment_hashes = Root::from_id(&self.id["blake3/".len()..])
+                        .and_then(|id| CheckedTreeFile::open_stored(&id));
                 }
-                let Some(ref tree_mmap) = self.segment_hashes else {
+                let Some(ref tree) = self.segment_hashes else {
                     debug!("{} not ready but got blake3 content already",self.id);
                     return vec![];
                 };
-                let hash = &self.id["blake3/".len()..];
-                let Some(ok) =
-                    block_matches_tree_v2(tree_mmap, hash, block_number, &content.base64)
-                else {
+                let block = Block { index: BlockIndex(block_number), bytes: &content.base64 };
+                let Some(ok) = tree.block_matches(&block) else {
                     return vec![];
                 };
                 if !ok {
@@ -5024,7 +5180,7 @@ impl InboundState {
                 && content.base64.len() >= 4
             {
                 let magic = &content.base64[..4];
-                if magic != b"B3T\x02" {
+                if *magic != TREE_MAGIC {
                     warn!("{} writing block0 with bad magic {:02x}{:02x}{:02x}{:02x} (len={} eof={}) -- sender gave zeros?", self.id, magic[0], magic[1], magic[2], magic[3], content.base64.len(), self.eof);
                 }
             }
