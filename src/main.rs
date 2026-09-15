@@ -1522,20 +1522,12 @@ fn check_tree_v2_data(data: &[u8], expected_hash: &str, n_leaves: usize) -> Vec<
 mod tree_v2_tests {
     use super::*;
 
-    // The tree file for `content` and its leaf count, built in memory the way
-    // build_tree_from_mmap builds one on disk, so tests need no ./cjp2p directory.
+    // The tree file for `content` and its leaf count, built in memory by the same
+    // write_tree_v2 that build_tree_from_mmap uses, so tests need no ./cjp2p directory.
     fn tree_v2_for(content: &[u8]) -> (MmapMut, usize) {
         let n_leaves = (content.len() + BLOCK_SIZE!() - 1) / BLOCK_SIZE!();
         let mut tree = MmapMut::map_anon(tree_file_size_v2(n_leaves)).unwrap();
-        let leaf_base = tree.len() - n_leaves * 32;
-        for (i, block) in content.chunks(BLOCK_SIZE!()).enumerate() {
-            let cv = block_chaining_value(block, (i * BLOCK_SIZE!()) as u64);
-            tree[leaf_base + i * 32..leaf_base + (i + 1) * 32].copy_from_slice(&cv);
-        }
-        if finalize_tree_mmap_v2(&mut tree, n_leaves).is_none() {
-            // one block: nothing to merge, so build_tree_from_mmap writes the content's hash
-            tree[32..64].copy_from_slice(blake3::hash(content).as_bytes());
-        }
+        write_tree_v2(&mut tree, content, None);
         (tree, n_leaves)
     }
 
@@ -1601,6 +1593,76 @@ mod tree_v2_tests {
             assert_eq!(piece, built[offset..end], "offset={offset} len={len}");
         }
     }
+
+    // Content for the vectors in docs/blake3_tree_v2.md.
+    fn vector_content(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+            .collect()
+    }
+
+    // The root is blake3::hash of the content, which is why blake3/<x> and
+    // blake3_tree_v2/<x> share a digest. With two or more blocks the root is merged from
+    // the leaves, so this fails if leaf hashing or pairing drifts from BLAKE3's own tree.
+    // One block has nothing to merge and write_tree_v2 writes blake3::hash itself, so
+    // asserting it there would only repeat that; the vectors below pin those files.
+    #[test]
+    fn tree_root_is_blake3_of_the_content() {
+        for len in [4097, 8192, 8193, 12288, 20487, 36864, 69627, 4096003] {
+            let content = vector_content(len);
+            let (tree, n_leaves) = tree_v2_for(&content);
+            assert!(n_leaves >= 2, "len={len}");
+            assert_eq!(tree[32..64], *blake3::hash(&content).as_bytes(), "len={len}");
+        }
+    }
+
+    // Frozen tree files from docs/blake3_tree_v2.md, so a change that keeps the root
+    // but moves any byte of the file fails too. Every row is checked.
+    #[test]
+    fn tree_files_match_the_documented_vectors() {
+        let vectors = [
+            (1, "f9bdfcba1505cc664da89bd5df105be977f92897b086075d8f5a1f269b558617"),
+            (4095, "a01d7cd85bd5658ded393a72b4c29d08ff56c11051e909eb9c6b9cb7558d4c10"),
+            (4096, "522ea88ecf2d1e1aac04999a7aedd94737f9fb7103845514a9e40e9debb3aaaa"),
+            (4097, "87f802b424302b94c4868dc06198717fdf4ab560e0222e4aad97a17cecbd5acd"),
+            (12288, "5d48cc4c90539edbc02964d82e6afc66c488c64aa9e61c502d8cee2b7d626a4d"),
+            (20487, "12b0d11acc8d51874e79b02b88bde5245539cd838e4838dda0bfbe8d2a35a5c8"),
+            (36864, "6e0289148cd873e7e767f59b3696b6f886731952599051b0e08fac2a8b2796dc"),
+            (4096003, "2889acac4c8013e2e03dbe27ea48675b9da9b61e904ffcceb39271bbe9a7f587"),
+        ];
+        for (len, tree_file_hash) in vectors {
+            let (tree, _) = tree_v2_for(&vector_content(len));
+            assert_eq!(blake3::hash(&tree).to_hex().as_str(), tree_file_hash, "len={len}");
+        }
+    }
+}
+
+// Writes the whole tree file for `content` into `tree`, which is tree_file_size_v2 long,
+// and returns its root. If sha256 is Some, updates it with every block in the same pass.
+// Apart from the file handling in build_tree_from_mmap so tests build trees with it too.
+fn write_tree_v2(
+    tree: &mut MmapMut,
+    content: &[u8],
+    mut sha256: Option<&mut Sha256>,
+) -> blake3::Hash {
+    let n_leaves = (content.len() + BLOCK_SIZE!() - 1) / BLOCK_SIZE!();
+    let leaf_base = tree.len() - n_leaves * 32;
+    let mut offset: u64 = 0;
+    for (i, chunk) in content.chunks(BLOCK_SIZE!()).enumerate() {
+        if let Some(ref mut h) = sha256 {
+            h.update(chunk);
+        }
+        let cv = block_chaining_value(chunk, offset);
+        tree[leaf_base + i * 32..leaf_base + (i + 1) * 32].copy_from_slice(&cv);
+        offset += chunk.len() as u64;
+    }
+    if let Some(root) = finalize_tree_mmap_v2(tree, n_leaves) {
+        return root;
+    }
+    // one block: nothing to merge, so the root is the content's own hash
+    let root = blake3::hash(content);
+    tree[32..64].copy_from_slice(root.as_bytes());
+    root
 }
 
 // Build the tree file from a source mmap in one pass.
@@ -1609,7 +1671,7 @@ mod tree_v2_tests {
 fn build_tree_from_mmap(
     src: &Mmap,
     file_size: usize,
-    mut sha256: Option<&mut Sha256>,
+    sha256: Option<&mut Sha256>,
 ) -> Option<String> {
     let n_leaves = (file_size + BLOCK_SIZE!() - 1) / BLOCK_SIZE!();
     let tree_tmp = format!("./cjp2p/public/.tmp_tree_{:016x}", rand::rng().random::<u64>());
@@ -1622,24 +1684,7 @@ fn build_tree_from_mmap(
     let tsize = tree_file_size_v2(n_leaves);
     tf.set_len(tsize as u64).ok()?;
     let mut tmm = unsafe { MmapMut::map_mut(&tf) }.ok()?;
-    let leaf_base = tsize - n_leaves * 32;
-    let mut offset: u64 = 0;
-    for (i, chunk) in src.chunks(BLOCK_SIZE!()).enumerate() {
-        if let Some(ref mut h) = sha256 {
-            h.update(chunk);
-        }
-        let cv = block_chaining_value(chunk, offset);
-        tmm[leaf_base + i * 32..leaf_base + (i + 1) * 32].copy_from_slice(&cv);
-        offset += chunk.len() as u64;
-    }
-    let blake3_id = if n_leaves == 1 {
-        finalize_tree_mmap_v2(&mut tmm, 1);
-        let h = blake3::hash(&src[..file_size]);
-        tmm[32..64].copy_from_slice(h.as_bytes());
-        format!("{}", h)
-    } else {
-        format!("{}", finalize_tree_mmap_v2(&mut tmm, n_leaves).unwrap())
-    };
+    let blake3_id = format!("{}", write_tree_v2(&mut tmm, &src[..file_size], sha256));
     drop(tmm);
     drop(tf);
     let tree_path = format!("./cjp2p/public/blake3_tree_v2/{}", blake3_id);
