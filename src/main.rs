@@ -1531,6 +1531,16 @@ impl<B: AsRef<[u8]>> UncheckedTreeFile<B> {
             error!("tree check: no block count gives a {} byte tree file", data.len());
             return Err((self.0, vec![0]));
         };
+        // 1b. at least two blocks. A one-block tree is not a tree: its single leaf
+        // is no input to the root (that root is blake3::hash of the content), so
+        // nothing in the file is bound to the id and its 32 leaf bytes are an
+        // unvouched channel a peer can stamp each copy with. Content that small is
+        // named by its blake3 id and checked by hashing it whole, which is all a
+        // one-block tree could ever have told us.
+        if shape.blocks() < 2 {
+            error!("tree check: a {} byte tree file describes one block, which is not a tree", data.len());
+            return Err((self.0, vec![0]));
+        }
         // 2. the magic
         if data[0..4] != TREE_MAGIC {
             warn!("check_tree_v2_data: bad magic {:02x}{:02x}{:02x}{:02x} len={}", data[0], data[1], data[2], data[3], data.len());
@@ -1634,9 +1644,6 @@ impl<B: AsRef<[u8]>> CheckedTreeFile<B> {
 
     // None: the tree has no such block
     fn block_matches(&self, block: &Block) -> Option<bool> {
-        if self.shape.blocks() == 1 {
-            return (block.index.0 == 0).then(|| Root::from_single_block(block) == self.root());
-        }
         Some(ChainingValue::from_block(block) == self.leaf(block.index)?)
     }
 }
@@ -1722,24 +1729,25 @@ mod tree_v2_tests {
     }
 
     #[test]
-    fn one_block_trees_work() {
+    fn one_block_trees_are_refused() {
         for n in 1..=300 {
             let len = TreeShape::for_blocks(n).file_len();
             assert_eq!(TreeShape::from_file_len(len).map(|s| s.blocks()), Some(n));
         }
+        // A one-block tree's leaf is no input to its root, so a changed leaf used
+        // to pass: nothing in the file was bound to the id. Refuse the file rather
+        // than accept an unvouched leaf; content this small is named by its blake3
+        // id, which checks it by hashing it whole.
         for data in [vec![7u8], vec![7u8; BLOCK_SIZE]] {
             let (tree, root) = tree_v2_for(&data);
-            let checked = UncheckedTreeFile(&tree[..]).check(&root).ok().unwrap();
-            assert_eq!(checked.block_matches(&block(0, &data)), Some(true));
-            assert_eq!(checked.block_matches(&block(0, &data[1..])), Some(false));
-            assert_eq!(checked.block_matches(&block(1, &data)), None);
-
-            // the leaf is no input to the root, so a changed leaf still passes
-            let mut changed = tree.clone();
-            let last = changed.len() - 1;
-            changed[last] ^= 1;
-            assert!(check(&changed, &root).is_ok());
+            assert!(UncheckedTreeFile(&tree[..]).check(&root).is_err());
+            assert!(check(&tree, &root).is_err());
         }
+        // Two blocks is the smallest tree there is, and its leaves do bind.
+        let data = vec![7u8; BLOCK_SIZE + 1];
+        let (tree, root) = tree_v2_for(&data);
+        let checked = UncheckedTreeFile(&tree[..]).check(&root).ok().unwrap();
+        assert_eq!(checked.block_matches(&block(0, &data[..BLOCK_SIZE])), Some(true));
     }
 
     #[test]
