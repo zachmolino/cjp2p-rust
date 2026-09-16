@@ -827,9 +827,7 @@ impl PeerState {
 
         if cg.only_if_cached {
             // An in-progress download is not "cached": its blocks are unverified.
-            cg.http_socket
-                .write_all(b"HTTP/1.0 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
-                .ok();
+            answer_504(&mut cg.http_socket);
             self.content_gateways.remove(cg_index);
             return;
         }
@@ -1287,6 +1285,13 @@ fn parse_header(stream: &mut TcpStream) -> Option<HttpRequest> {
 }
 
 // RFC 9111 5.2.1.7
+// only-if-cached with nothing cached: RFC 9111 5.2.1.7 wants a 504, not a fetch
+fn answer_504(stream: &mut TcpStream) {
+    stream
+        .write_all(b"HTTP/1.0 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
+        .ok();
+}
+
 fn has_only_if_cached(headers: &HashMap<String, String>) -> bool {
     headers
         .get("cache-control")
@@ -3194,6 +3199,7 @@ fn handle_web_request(
     };
     let mut start: usize = 0;
     let mut end: usize = 0;
+    let only_if_cached = has_only_if_cached(&req.headers);
     if req.path == "/" {
         debug!("got http request for {:?}",req);
         status_page(inbound_states, ps, stream);
@@ -3352,11 +3358,8 @@ fn handle_web_request(
                     return;
                 }
                 // only-if-cached: no GetLatest goes out, so the mapping has to be cached too
-                let only_if_cached = has_only_if_cached(&req.headers);
                 if only_if_cached && sha256_opt.is_none() {
-                    stream
-                        .write_all(b"HTTP/1.0 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
-                        .ok();
+                    answer_504(&mut stream);
                     return;
                 }
                 let pending_latest = if sha256_opt.is_none() {
@@ -3569,7 +3572,7 @@ fn handle_web_request(
         eof: None,
         pending_latest: None,
         initiator: Initiator::ByHash,
-        only_if_cached: has_only_if_cached(&req.headers),
+        only_if_cached,
     });
     ps.serve_http_content(stream_states, inbound_states, index);
 }
